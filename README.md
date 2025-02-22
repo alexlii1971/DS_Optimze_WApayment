@@ -432,7 +432,7 @@ wp option set wcpay_split_rule '{"merchant_id_1": 0.7, "merchant_id_2": 0.3}' --
 通过严格的测试和灵活的部署方案，本插件能够满足不同规模站点的需求，确保支付功能的高效、安全和合规。
 
 
-### **WordPress Multisite WooCommerce 微信支付宝支付插件开发方案**
+### **WordPress Multisite WooCommerce 微信支付宝支付插件开发方案（合并）**
 
 ---
 
