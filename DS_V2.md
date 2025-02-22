@@ -1095,5 +1095,214 @@ JOIN fund_flow f ON a.target_id = f.flow_id;
 
 ---
 
+---
+
+## **五、系统监控与报警机制**
+
+### **5.1 监控指标与阈值**
+
+#### **5.1.1 核心监控指标**
+| **监控项**               | **指标类型**   | **正常范围**          | **报警阈值**         |
+|--------------------------|----------------|-----------------------|----------------------|
+| 支付接口响应时间         | 平均值（P99）  | < 500ms               | > 2000ms（持续5分钟）|
+| 分账任务队列积压数       | 实时计数        | < 100                 | > 500                |
+| 数据库主从同步延迟       | 时间差（秒）    | < 5s                  | > 30s                |
+| 证书有效期               | 剩余天数        | > 7天                 | < 3天                |
+| 异常登录尝试次数         | 每小时计数      | < 5                   | > 10                 |
+
+#### **5.1.2 Prometheus配置示例**
+```yaml
+scrape_configs:
+  - job_name: 'payment_gateway'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['payment-service:9090']
+        
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['mysql-master:9104', 'mysql-slave:9104']
+
+alerting_rules:
+  - alert: HighPaymentLatency
+    expr: avg_over_time(payment_latency_seconds{job="payment_gateway"}[5m]) > 2
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "支付接口延迟过高"
+      description: "{{ $labels.instance }} 的P99延迟已达 {{ $value }}秒"
+```
+
+---
+
+### **5.2 报警通知渠道**
+
+#### **5.2.1 报警路由规则**
+```mermaid
+graph TD
+    A[Prometheus Alert] --> B{严重等级}
+    B -->|Critical| C[电话通知值班人员]
+    B -->|Warning| D[企业微信/钉钉通知]
+    B -->|Info| E[邮件通知运维团队]
+```
+
+#### **5.2.2 电话报警集成**
+```python
+def call_onduty_engineer(alert):
+    twilio_client = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
+    call = twilio_client.calls.create(
+        url='http://alert-system/voice.xml',
+        to=ONCALL_PHONE,
+        from_=TWILIO_NUMBER
+    )
+    log_alert_action(f"已拨打值班电话: {call.sid}")
+```
+
+---
+
+## **六、灾备恢复方案**
+
+### **6.1 数据备份策略**
+
+#### **6.1.1 备份类型与频率**
+| **备份类型**       | **范围**                    | **频率**     | **保留策略**          |
+|--------------------|-----------------------------|-------------|----------------------|
+| 全量备份           | 所有数据库+插件配置          | 每日凌晨2点 | 保留最近7天           |
+| 增量备份           | 交易流水+分账记录            | 每小时一次  | 保留48小时            |
+| 紧急快照           | 内存状态+会话信息            | 手动触发    | 保留至问题解决         |
+
+#### **6.1.2 备份验证脚本**
+```bash
+#!/bin/bash
+# 验证备份完整性
+LAST_BACKUP=$(ls -t /backups | head -1)
+CHECKSUM=$(sha256sum /backups/$LAST_BACKUP | cut -d' ' -f1)
+
+if mysqldump --verify backup_checksums | grep -q $CHECKSUM; then
+    echo "备份验证通过: $LAST_BACKUP"
+else
+    echo "备份损坏！立即触发警报！"
+    send_alert "Backup verification failed"
+fi
+```
+
+---
+
+### **6.2 故障切换流程**
+
+#### **6.2.1 数据库故障切换**
+```mermaid
+sequenceDiagram
+    监控系统->>+主数据库: 健康检查失败
+    监控系统->>+HAProxy: 下线主节点
+    HAProxy->>+从数据库: 提升为主库
+    监控系统->>+应用服务器: 切换数据源
+    应用服务器->>新主库: 测试写入
+    新主库-->>应用服务器: 确认成功
+```
+
+#### **6.2.2 支付服务切换**
+```nginx
+# 备用服务启动配置
+server {
+    listen 80;
+    server_name backup-payment.example.com;
+    
+    location / {
+        proxy_pass http://payment-backup-cluster;
+        proxy_set_header Host $host;
+        
+        # 仅允许灾备网络访问
+        allow 10.0.0.0/8;
+        deny all;
+    }
+}
+```
+
+---
+
+### **6.3 灾备演练计划**
+
+#### **6.3.1 演练类型**
+| **演练场景**         | **频率**   | **成功标准**                          |
+|----------------------|------------|---------------------------------------|
+| 数据库主从切换       | 每季度一次 | 切换时间<5分钟，数据零丢失             |
+| 全站服务迁移         | 每年一次   | 业务中断时间<1分钟                     |
+| 支付链路压测         | 每月一次   | 10,000 TPS下无失败交易                 |
+
+#### **6.3.2 演练记录模板**
+```markdown
+# 灾备演练报告
+
+## 基本信息
+- **演练时间**: 2023-09-15 02:00 UTC
+- **参与团队**: 运维部、支付研发部
+
+## 演练结果
+| **指标**         | **预期值** | **实际值** | **结论** |
+|------------------|------------|------------|----------|
+| 数据库切换时间   | <5min      | 3m28s      | ✔️ 达标   |
+| 交易失败率       | 0%         | 0.02%      | ⚠️ 需优化 |
+
+## 后续改进
+1. 优化从库预热机制（ETA 2023-10）
+2. 增加交易重试策略（ETA 2023-11）
+```
+
+---
+
+## **七、高可用架构设计**
+
+### **7.1 多活部署方案**
+```mermaid
+graph TB
+    subgraph 区域A
+        A1[LB] --> A2[支付服务]
+        A2 --> A3[MySQL集群]
+    end
+    
+    subgraph 区域B
+        B1[LB] --> B2[支付服务]
+        B2 --> B3[MySQL集群]
+    end
+    
+    A3 <--> B3: 双向数据同步
+    A2 <--> B2: 心跳检测
+```
+
+### **7.2 流量调度策略**
+```nginx
+# 基于地理位置的路由
+map $geoip_country_code $backend {
+    default payment-us;
+    CN      payment-cn;
+    EU      payment-eu;
+}
+
+server {
+    location / {
+        proxy_pass http://$backend;
+    }
+}
+```
+
+---
+
+## **八、附录**
+
+### **8.1 监控部署检查清单**
+1. [ ] Prometheus Server 配置完成
+2. [ ] Alertmanager 集成通知渠道
+3. [ ] Grafana 仪表盘导入
+4. [ ] 各服务暴露/metrics端点
+5. [ ] 基线性能指标采集验证
+
+### **8.2 灾备工具箱**
+- **紧急切换脚本**：`/scripts/failover.sh`
+- **备份恢复工具**：`/scripts/restore_backup.py`
+- **网络隔离命令集**：`/docs/network_isolation.md`
+
+---
+
 
  
