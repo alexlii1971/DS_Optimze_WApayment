@@ -145,13 +145,13 @@ document.querySelector('input[name="payment_domain"]').addEventListener('blur', 
     }
 });
 ```
-### **6.2 C端消费者使用**  
+### **6.2 C端消费者Woocommerce支付界面**  
 #### **6.2.1 微信支付：**  
 手机网页端唤醒微信 App 支付。
 电脑端扫码支付。
 兼容微信登录插件的 OpenID 或 UnionID。
 
-#### **6.2.1 支付宝支付：**  
+#### **6.2.2 支付宝支付：**  
 手机网页端唤醒支付宝 App 支付。
 电脑端扫码支付。
 
