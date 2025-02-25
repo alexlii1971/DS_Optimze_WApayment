@@ -194,6 +194,19 @@ document.querySelector('input[name="payment_domain"]').addEventListener('blur', 
 
 #### **7.1.3 日志看板及路径：**  
 不同分类日志因权限不同，需要不同的查看路径，需要与其权限相匹配。
+
+
+### **7.2 即时版本控制**   
+所有文件创建及更新，则升级版本，在文件名与代码内容中同时标记版本，以保证项目所有文件合并时所有文件为最新内容。
+
+### **7.3 wordpress\Woocommerce兼容** 
+始终检查wordpress\Woocommerce最新版本，并保证兼容。
+#### **7.3.1 wordpress 最新版本：** 
+ https://wordpress.org/news/category/releases/
+ https://github.com/WordPress/WordPress/tags
+
+#### **7.3.2 Woocommerce 最新版本校验：** 
+https://github.com/woocommerce/woocommerce/releases
  
 #### **SQL索引优化**  
 ```sql
