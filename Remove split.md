@@ -171,6 +171,7 @@ document.querySelector('input[name="payment_domain"]').addEventListener('blur', 
 支持最新版本的wordpress/Woocommerce：
 
 https://wordpress.org/download/releases/
+
 https://github.com/woocommerce/woocommerce/releases
 
 ---
