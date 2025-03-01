@@ -1,5 +1,5 @@
 [file name]: DS_V2_No_Split.md  
-[file content begin]  
+
 
 ---
 
@@ -34,6 +34,8 @@
 | 支持子站独立激活模式     | 子站可独立配置支付域名、商户号、API密钥     | 数据库隔离，独立配置界面          |
 | 支持全局支付统一配置     | 超级管理员可设置全站支付参数，子站可继承    | 网络级配置存储，子站覆盖逻辑       |
 
+### **1.1 支持Woocommerce checkout Block**  
+同时兼容woocommerce classic check和支持Woocommerce checkout Block
 
 ### **2. 业务模块** 
 
@@ -164,6 +166,14 @@ document.querySelector('input[name="payment_domain"]').addEventListener('blur', 
 | 压力测试报告             | 支持10,000 TPS无丢单                        | JMeter测试计划，结果分析          |
 
 ---
+## **七、Wordpress/Woocommerce版本支持**  
+
+支持最新版本的wordpress/Woocommerce：
+
+https://wordpress.org/download/releases/
+https://github.com/woocommerce/woocommerce/releases
+
+---
 
 ### **附录**  
 1. **使用说明**：开发过程中逐项核对，完成后标记状态（✅/⚠️/❌）。  
@@ -177,4 +187,4 @@ document.querySelector('input[name="payment_domain"]').addEventListener('blur', 
 **注**：此版本为移除分账功能后的精简文档，保留核心支付与安全需求。  
 
 ---  
-[file content end]
+
