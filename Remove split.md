@@ -102,7 +102,11 @@
 
 只在子站激活时的插件配置管理地址。
 
-#### **5.1.2 前端实时校验示例**  
+#### **5.1.2 开启/关闭 全站网络级别配置**  
+
+一旦开启，子站自动继承全站网络级配置！
+
+#### **5.1.3 前端实时校验示例**  
 ```javascript
 // 支付域名格式校验
 document.querySelector('input[name="payment_domain"]').addEventListener('blur', function(e) {
