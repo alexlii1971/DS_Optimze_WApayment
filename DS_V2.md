@@ -153,9 +153,13 @@ def verify_license(file_path):
 | 分账规则编辑器           | 可视化配置分账比例/阶梯                     | 动态表单，规则预览                |
 | 审核看板                 | 展示待审商户列表及材料                      | 文件预览插件集成                  |
 
+#### **6.1.1 管理配置地址**  
+网络激活时的菜单与插件配置管理地址，子站插件配置管理地址。
+之在子站激活时的插件配置管理地址。
 
 
-#### **6.1.1 前端实时校验示例**  
+
+#### **6.1.2 前端实时校验示例**  
 ```javascript
 // 支付域名格式校验
 document.querySelector('input[name="payment_domain"]').addEventListener('blur', function(e) {
