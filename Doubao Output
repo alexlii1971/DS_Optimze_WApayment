@@ -1,0 +1,800 @@
+==== ./wordpress-multisite-payment-plugin.php ====
+<?php
+/*
+Plugin Name: WordPress 多站点支付插件 - v1.3
+Description: 支持微信和支付宝支付的多站点支付插件
+Version: 1.3
+Author: Your Name
+*/
+
+// 引入数据库操作文件
+require_once( plugin_dir_path( __FILE__ ). 'includes/database.php' );
+
+// 插件激活时触发的函数
+register_activation_hook( __FILE__, 'wmpp_plugin_activation' );
+
+function wmpp_plugin_activation() {
+    // 调用数据库创建函数
+    wmpp_create_database_and_tables();
+}
+
+// 引入必要的文件
+require_once( plugin_dir_path( __FILE__ ). 'includes/config/multisite-config.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/config/payment-gateway-config.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/core/payment-core.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/core/security.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/monitoring/payment-monitoring.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/monitoring/certificate-expiry.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/monitoring/login-monitoring.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/utilities/logging.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/utilities/multilingual.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/utilities/validation.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/sdk/wechat-sdk.php' );
+require_once( plugin_dir_path( __FILE__ ). 'includes/sdk/alipay-sdk.php' );
+
+// 初始化支付核心类
+function wmpp_init_payment_core() {
+    $wechat_config = wmpp_get_payment_config('wechat');
+    $alipay_config = wmpp_get_payment_config('alipay');
+
+    $wechat_sdk = new WeChatPaymentSDK($wechat_config);
+    $alipay_sdk = new AlipayPaymentSDK($alipay_config);
+
+    return new PaymentCore($wechat_sdk, $alipay_sdk);
+}
+
+
+==== ./includes/core/payment-core.php ====
+<?php
+interface WeChatPaymentInterface {
+    public function processPayment($orderData);
+}
+
+interface AlipayPaymentInterface {
+    public function processPayment($orderData);
+}
+
+class PaymentCore {
+    private $wechatPayment;
+    private $alipayPayment;
+
+    public function __construct(WeChatPaymentInterface $wechatPayment, AlipayPaymentInterface $alipayPayment) {
+        $this->wechatPayment = $wechatPayment;
+        $this->alipayPayment = $alipayPayment;
+    }
+
+    /**
+     * 处理微信支付
+     *
+     * @param array $orderData 订单数据
+     * @return mixed 支付结果
+     */
+    public function handleWeChatPayment($orderData) {
+        if (!$this->validateOrderData($orderData)) {
+            return new WP_Error('invalid_order_data', __('订单数据无效，请检查输入。', 'wordpress-multisite-payment-plugin'));
+        }
+        $result = $this->wechatPayment->processPayment($orderData);
+        return $this->processPaymentResult($result, 'wechat');
+    }
+
+    /**
+     * 处理支付宝支付
+     *
+     * @param array $orderData 订单数据
+     * @return mixed 支付结果
+     */
+    public function handleAlipayPayment($orderData) {
+        if (!$this->validateOrderData($orderData)) {
+            return new WP_Error('invalid_order_data', __('订单数据无效，请检查输入。', 'wordpress-multisite-payment-plugin'));
+        }
+        $result = $this->alipayPayment->processPayment($orderData);
+        return $this->processPaymentResult($result, 'alipay');
+    }
+
+    /**
+     * 验证订单数据
+     *
+     * @param array $orderData 订单数据
+     * @return bool 是否有效
+     */
+    private function validateOrderData($orderData) {
+        if (empty($orderData['order_id']) || empty($orderData['amount'])) {
+            return false;
+        }
+        if (!is_numeric($orderData['amount']) || $orderData['amount'] <= 0) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 处理支付结果
+     *
+     * @param mixed $result 支付结果
+     * @param string $paymentType 支付类型
+     * @return mixed 处理后的结果
+     */
+    private function processPaymentResult($result, $paymentType) {
+        if (is_wp_error($result)) {
+            wmpp_log_payment_error($result->get_error_message(), $paymentType);
+            return $result;
+        }
+        if ($result['status'] === 'success') {
+            wmpp_log_payment_success($result, $paymentType);
+        } else {
+            wmpp_log_payment_error(json_encode($result), $paymentType);
+        }
+        return $result;
+    }
+}
+
+
+==== ./includes/core/security.php ====
+<?php
+/**
+ * 加密函数
+ *
+ * @param string $data 要加密的数据
+ * @return string 加密后的数据
+ */
+function encrypt($data) {
+    $encryption_key = openssl_random_pseudo_bytes(32);
+    $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length('aes - 256 - cbc'));
+    $encrypted = openssl_encrypt($data, 'aes - 256 - cbc', $encryption_key, 0, $iv);
+    return base64_encode($encrypted. '::'. $iv. '::'. $encryption_key);
+}
+
+/**
+ * 解密函数
+ *
+ * @param string $encrypted_data 加密的数据
+ * @return string 解密后的数据
+ */
+function decrypt($encrypted_data) {
+    list($encrypted_data, $iv, $encryption_key) = explode('::', base64_decode($encrypted_data), 3);
+    return openssl_decrypt($encrypted_data, 'aes - 256 - cbc', $encryption_key, 0, $iv);
+}
+
+
+==== ./includes/config/multisite-config.php ====
+<?php
+/**
+ * 获取子站点配置
+ *
+ * @param string $option_name 配置项名称
+ * @param mixed $default 默认值
+ * @return mixed 配置值
+ */
+function wmpp_get_subsite_config($option_name, $default = null) {
+    return get_blog_option(get_current_blog_id(), $option_name, $default);
+}
+
+/**
+ * 设置子站点配置
+ *
+ * @param string $option_name 配置项名称
+ * @param mixed $value 配置值
+ * @return bool 是否设置成功
+ */
+function wmpp_set_subsite_config($option_name, $value) {
+    return update_blog_option(get_current_blog_id(), $option_name, $value);
+}
+
+/**
+ * 获取全局配置
+ *
+ * @param string $option_name 配置项名称
+ * @param mixed $default 默认值
+ * @return mixed 配置值
+ */
+function wmpp_get_global_config($option_name, $default = null) {
+    return get_site_option($option_name, $default);
+}
+
+/**
+ * 设置全局配置
+ *
+ * @param string $option_name 配置项名称
+ * @param mixed $value 配置值
+ * @return bool 是否设置成功
+ */
+function wmpp_set_global_config($option_name, $value) {
+    return update_site_option($option_name, $value);
+}
+
+
+==== ./includes/config/payment-gateway-config.php ====
+<?php
+require_once plugin_dir_path(__FILE__). '../utilities/validation.php';
+require_once plugin_dir_path(__FILE__). '../core/security.php';
+
+/**
+ * 处理支付配置
+ *
+ * @param string $payment_type 支付类型（'wechat' 或 'alipay'）
+ * @param array $config_data 配置数据
+ * @return bool|WP_Error 是否保存成功或错误信息
+ */
+function wmpp_process_payment_config($payment_type, $config_data) {
+    if ($payment_type === 'wechat') {
+        $is_valid = wmpp_validate_wechat_credentials($config_data);
+        if (!$is_valid) {
+            return new WP_Error('wechat_config_invalid', __('微信支付配置信息无效，请检查输入。', 'wordpress-multisite-payment-plugin'));
+        }
+        $encrypted_config = [];
+        foreach ($config_data as $key => $value) {
+            $encrypted_config[$key] = encrypt($value);
+        }
+        return wmpp_set_global_config('wmpp_wechat_payment_config', $encrypted_config);
+    } elseif ($payment_type === 'alipay') {
+        $is_valid = wmpp_validate_alipay_credentials($config_data);
+        if (!$is_valid) {
+            return new WP_Error('alipay_config_invalid', __('支付宝支付配置信息无效，请检查输入。', 'wordpress-multisite-payment-plugin'));
+        }
+        $encrypted_config = [];
+        foreach ($config_data as $key => $value) {
+            $encrypted_config[$key] = encrypt($value);
+        }
+        return wmpp_set_global_config('wmpp_alipay_payment_config', $encrypted_config);
+    }
+    return new WP_Error('unknown_payment_type', __('未知的支付类型。', 'wordpress-multisite-payment-plugin'));
+}
+
+/**
+ * 获取支付配置
+ *
+ * @param string $payment_type 支付类型（'wechat' 或 'alipay'）
+ * @return array|WP_Error 配置数据或错误信息
+ */
+function wmpp_get_payment_config($payment_type) {
+    if ($payment_type === 'wechat') {
+        $encrypted_config = wmpp_get_global_config('wmpp_wechat_payment_config', []);
+        $decrypted_config = [];
+        foreach ($encrypted_config as $key => $value) {
+            $decrypted_config[$key] = decrypt($value);
+        }
+        return $decrypted_config;
+    } elseif ($payment_type === 'alipay') {
+        $encrypted_config = wmpp_get_global_config('wmpp_alipay_payment_config', []);
+        $decrypted_config = [];
+        foreach ($encrypted_config as $key => $value) {
+            $decrypted_config[$key] = decrypt($value);
+        }
+        return $decrypted_config;
+    }
+    return new WP_Error('unknown_payment_type', __('未知的支付类型。', 'wordpress-multisite-payment-plugin'));
+}
+
+
+==== ./includes/database.php ====
+<?php
+// 引入 WordPress 数据库对象
+global $wpdb;
+
+/**
+ * 创建数据库表结构的函数
+ *
+ * 该函数会在 WordPress 现有的数据库中创建所需的表结构。
+ *
+ * @return void
+ */
+function wmpp_create_database_and_tables() {
+    global $wpdb;
+
+    // 支付日志表
+    $payment_logs_table = $wpdb->prefix . 'wmpp_payment_logs';
+    $charset_collate = $wpdb->get_charset_collate();
+    $create_payment_logs_table_query = "CREATE TABLE IF NOT EXISTS $payment_logs_table (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        payment_type varchar(20) NOT NULL,
+        log_type varchar(20) NOT NULL,
+        log_message text NOT NULL,
+        log_time datetime NOT NULL,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    $tableResult = dbDelta($create_payment_logs_table_query);
+    if (is_wp_error($tableResult)) {
+        $errorInfo = [
+            'sql_query' => $create_payment_logs_table_query,
+            'error_code' => $tableResult->get_error_code(),
+            'error_message' => $tableResult->get_error_message()
+        ];
+        error_log('支付日志表创建失败: '. json_encode($errorInfo));
+    }
+
+    // 操作审计日志表
+    $operation_logs_table = $wpdb->prefix . 'wmpp_operation_logs';
+    $create_operation_logs_table_query = "CREATE TABLE IF NOT EXISTS $operation_logs_table (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        operation text NOT NULL,
+        user_id int(11) NOT NULL,
+        ip_address varchar(45) NOT NULL,
+        timestamp datetime NOT NULL,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+    $tableResult = dbDelta($create_operation_logs_table_query);
+    if (is_wp_error($tableResult)) {
+        $errorInfo = [
+            'sql_query' => $create_operation_logs_table_query,
+            'error_code' => $tableResult->get_error_code(),
+            'error_message' => $tableResult->get_error_message()
+        ];
+        error_log('操作审计日志表创建失败: '. json_encode($errorInfo));
+    }
+
+    // 登录日志表
+    $login_logs_table = $wpdb->prefix . 'wmpp_login_logs';
+    $create_login_logs_table_query = "CREATE TABLE IF NOT EXISTS $login_logs_table (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        ip_address varchar(45) NOT NULL,
+        login_status varchar(20) NOT NULL,
+        failure_time datetime NOT NULL,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+    $tableResult = dbDelta($create_login_logs_table_query);
+    if (is_wp_error($tableResult)) {
+        $errorInfo = [
+            'sql_query' => $create_login_logs_table_query,
+            'error_code' => $tableResult->get_error_code(),
+            'error_message' => $tableResult->get_error_message()
+        ];
+        error_log('登录日志表创建失败: '. json_encode($errorInfo));
+    }
+}
+
+
+==== ./includes/utilities/multilingual.php ====
+<?php
+/**
+ * 加载多语言文本域
+ *
+ * @return void
+ */
+function wmpp_load_textdomain() {
+    load_plugin_textdomain('wordpress-multisite-payment-plugin', false, basename(dirname(__FILE__)) . '/../languages');
+}
+add_action('plugins_loaded', 'wmpp_load_textdomain');
+
+/**
+ * 获取翻译后的文本
+ *
+ * @param string $text 原文
+ * @return string 翻译后的文本
+ */
+function wmpp_get_translated_text($text) {
+    return __($text, 'wordpress-multisite-payment-plugin');
+}
+
+
+==== ./includes/utilities/validation.php ====
+<?php
+/**
+ * 验证微信支付凭证
+ *
+ * @param array $credentials 凭证信息
+ * @return bool 是否有效
+ */
+function wmpp_validate_wechat_credentials($credentials) {
+    if (empty($credentials['app_id']) || empty($credentials['mch_id']) || empty($credentials['api_key'])) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * 验证支付宝支付凭证
+ *
+ * @param array $credentials 凭证信息
+ * @return bool 是否有效
+ */
+function wmpp_validate_alipay_credentials($credentials) {
+    if (empty($credentials['app_id']) || empty($credentials['private_key']) || empty($credentials['public_key'])) {
+        return false;
+    }
+    return true;
+}
+
+
+==== ./includes/utilities/logging.php ====
+<?php
+/**
+ * 通用的数据库插入日志函数
+ *
+ * @param string $tableName 要插入日志的数据库表名
+ * @param array $data 包含日志信息的数组
+ * @return bool|int 插入成功返回插入的记录 ID，失败返回 false
+ */
+function wmpp_insert_log($tableName, $data) {
+    global $wpdb;
+    $tableName = $wpdb->prefix . $tableName; // 确保使用 WordPress 表前缀
+    $sanitizedData = [];
+    foreach ($data as $key => $value) {
+        if ($key === 'log_message' && is_array($value)) {
+            $value = json_encode($value);
+        }
+        $sanitizedData[$key] = $wpdb->prepare('%s', $value);
+    }
+    $result = $wpdb->insert($tableName, $sanitizedData);
+    if ($result === false) {
+        $errorInfo = [
+            'error_type' => 'log_insert_failed',
+            'error_message' => '日志插入数据库失败',
+            'table_name' => $tableName,
+            'data' => $data
+        ];
+        error_log(json_encode($errorInfo));
+    }
+    return $result;
+}
+
+/**
+ * 记录支付错误日志
+ *
+ * @param string $errorMessage 错误信息
+ * @param string $paymentType 支付类型（如 'wechat' 或 'alipay'）
+ * @return bool|int 插入成功返回插入的记录 ID，失败返回 false
+ */
+function wmpp_log_payment_error($errorMessage, $paymentType) {
+    $tableName = 'wmpp_payment_logs';
+    $data = [
+        'payment_type' => $paymentType,
+        'log_type' => 'error',
+        'log_message' => $errorMessage,
+        'log_time' => current_time('mysql')
+    ];
+    return wmpp_insert_log($tableName, $data);
+}
+
+/**
+ * 记录支付成功日志
+ *
+ * @param mixed $paymentResult 支付成功的结果数据
+ * @param string $paymentType 支付类型（如 'wechat' 或 'alipay'）
+ * @return bool|int 插入成功返回插入的记录 ID，失败返回 false
+ */
+function wmpp_log_payment_success($paymentResult, $paymentType) {
+    $tableName = 'wmpp_payment_logs';
+    $data = [
+        'payment_type' => $paymentType,
+        'log_type' =>'success',
+        'log_message' => json_encode($paymentResult),
+        'log_time' => current_time('mysql')
+    ];
+    return wmpp_insert_log($tableName, $data);
+}
+
+/**
+ * 记录通用错误日志
+ *
+ * @param string $errorMessage 错误信息
+ * @param string $module 错误发生的模块
+ * @return bool|int 插入成功返回插入的记录 ID，失败返回 false
+ */
+function wmpp_log_error($errorMessage, $module) {
+    $tableName = 'wmpp_operation_logs';
+    $data = [
+        'operation' => "Error in $module: $errorMessage",
+        'user_id' => get_current_user_id(),
+        'ip_address' => $_SERVER['REMOTE_ADDR']?? 'unknown',
+        'timestamp' => current_time('mysql')
+    ];
+    return wmpp_insert_log($tableName, $data);
+}
+
+
+==== ./includes/sdk/wechat-sdk.php ====
+<?php
+require_once plugin_dir_path(__FILE__) . '../core/security.php';
+
+class WeChatPaymentSDK implements WeChatPaymentInterface {
+    private $config;
+
+    public function __construct($config) {
+        $this->config = $config;
+    }
+
+    /**
+     * 处理微信支付
+     *
+     * @param array $orderData 订单数据
+     * @return array|WP_Error 支付结果或错误信息
+     */
+    public function processPayment($orderData) {
+        try {
+            // 这里应调用微信支付 API 进行实际支付操作，以下是模拟
+            $start_time = current_time('mysql');
+            // 模拟调用微信支付接口
+            $response = [
+                'status' =>'success',
+                'order_id' => $orderData['order_id'],
+                'amount' => $orderData['amount'],
+                'payment_type' => 'wechat',
+                'start_time' => $start_time,
+                'end_time' => current_time('mysql')
+            ];
+            return $response;
+        } catch (Exception $e) {
+            return new WP_Error('wechat_payment_failed', $e->getMessage());
+        }
+    }
+}
+
+
+==== ./includes/sdk/alipay-sdk.php ====
+<?php
+require_once plugin_dir_path(__FILE__) . '../core/security.php';
+
+class AlipayPaymentSDK implements AlipayPaymentInterface {
+    private $config;
+
+    public function __construct($config) {
+        $this->config = $config;
+    }
+
+    /**
+     * 处理支付宝支付
+     *
+     * @param array $orderData 订单数据
+     * @return array|WP_Error 支付结果或错误信息
+     */
+    public function processPayment($orderData) {
+        try {
+            // 这里应调用支付宝支付 API 进行实际支付操作，以下是模拟
+            $start_time = current_time('mysql');
+            // 模拟调用支付宝支付接口
+            $response = [
+                'status' =>'success',
+                'order_id' => $orderData['order_id'],
+                'amount' => $orderData['amount'],
+                'payment_type' => 'alipay',
+                'start_time' => $start_time,
+                'end_time' => current_time('mysql')
+            ];
+            return $response;
+        } catch (Exception $e) {
+            return new WP_Error('alipay_payment_failed', $e->getMessage());
+        }
+    }
+}
+
+
+==== ./includes/monitoring/payment-monitoring.php ====
+<?php
+require_once plugin_dir_path(__FILE__). '../utilities/logging.php';
+require_once plugin_dir_path(__FILE__). 'prometheus-client.php';
+
+/**
+ * 监控支付延迟
+ *
+ * @param array $paymentResult 支付结果
+ * @param string $paymentType 支付类型
+ * @return void
+ */
+function wmpp_monitor_payment_delay($paymentResult, $paymentType) {
+    $start_time = $paymentResult['start_time']?? null;
+    $end_time = $paymentResult['end_time']?? null;
+    if ($start_time && $end_time) {
+        $delay = strtotime($end_time) - strtotime($start_time);
+        $threshold = wmpp_get_global_config('wmpp_payment_delay_threshold', 10);
+        if ($delay > $threshold) {
+            $errorInfo = [
+                'error_type' => 'payment_delay',
+                'error_message' => "支付延迟过长，延迟时间: $delay 秒，支付类型: $paymentType",
+                'payment_result' => $paymentResult
+            ];
+            wmpp_log_error(json_encode($errorInfo), 'payment-monitoring');
+            wmpp_send_payment_delay_alert($delay, $paymentType);
+        }
+        $prometheusClient = new PrometheusClient();
+        $prometheusClient->gauge('payment_delay_seconds', '支付延迟时间（秒）', $delay);
+    }
+}
+
+/**
+ * 发送支付延迟报警通知
+ *
+ * @param int $delay 延迟时间
+ * @param string $paymentType 支付类型
+ * @return void
+ */
+function wmpp_send_payment_delay_alert($delay, $paymentType) {
+    $alert_email = wmpp_get_global_config('wmpp_payment_delay_alert_email', '');
+    if (!empty($alert_email)) {
+        $subject = "支付延迟报警 - $paymentType";
+        $message = "支付类型 $paymentType 出现延迟，延迟时间为 $delay 秒，请及时处理。";
+        wp_mail($alert_email, $subject, $message);
+    }
+}
+
+
+==== ./includes/monitoring/login-monitoring.php ====
+<?php
+// 引入 Fail2Ban 集成相关逻辑（假设已正确引入）
+require_once plugin_dir_path(__FILE__) . '/fail2ban - integration.php';
+require_once plugin_dir_path(__FILE__) . '../utilities/logging.php';
+
+/**
+ * 异常登录检测函数
+ *
+ * 该函数用于检测当前登录是否为异常登录，通过获取当前登录 IP，
+ * 查询该 IP 在最近一小时内的登录失败次数，若超过 5 次则尝试封锁该 IP。
+ *
+ * @return void
+ */
+function wmpp_detect_abnormal_login() {
+    try {
+        // 获取当前登录 IP
+        $currentIp = $_SERVER['REMOTE_ADDR']?? null;
+        if (empty($currentIp)) {
+            $errorInfo = [
+                'error_type' => 'ip_address_not_found',
+                'error_message' => '无法获取当前登录 IP'
+            ];
+            wmpp_log_error(json_encode($errorInfo), 'login - monitoring');
+            return;
+        }
+
+        // 实际应用中应从日志或数据库获取登录失败次数，这里假设从数据库获取
+        global $wpdb;
+        $tableName = $wpdb->prefix . 'wmpp_login_logs';
+        $loginFailureCount = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM $tableName WHERE ip_address = %s AND login_status = 'failed' AND failure_time >= %s",
+                $currentIp,
+                date('Y - m - d H:i:s', strtotime('-1 hour'))
+            )
+        );
+
+        if ($loginFailureCount > 5) {
+            // 调用 Fail2Ban 集成函数封锁 IP
+            $blockResult = fail2ban_block_ip($currentIp);
+            if (!$blockResult) {
+                $errorInfo = [
+                    'error_type' => 'ip_block_failed',
+                    'error_message' => '封锁 IP 失败，IP: '. $currentIp,
+                    'ip_address' => $currentIp
+                ];
+                wmpp_log_error(json_encode($errorInfo), 'login - monitoring');
+            }
+        }
+    } catch (Exception $e) {
+        $errorInfo = [
+            'error_type' => get_class($e),
+            'error_message' => $e->getMessage(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine(),
+            'ip_address' => $currentIp?? 'unknown'
+        ];
+        wmpp_log_error(json_encode($errorInfo), 'login - monitoring');
+    }
+}
+
+
+==== ./includes/monitoring/prometheus-client.php ====
+<?php
+class PrometheusClient {
+    private $registry;
+
+    public function __construct() {
+        $this->registry = [];
+    }
+
+    /**
+     * 设置指标值
+     *
+     * @param string $name 指标名称
+     * @param string $help 指标说明
+     * @param float $value 指标值
+     * @return void
+     */
+    public function gauge($name, $help, $value) {
+        $this->registry[$name] = [
+            'help' => $help,
+            'value' => $value
+        ];
+        // 这里可以添加将数据发送到 Prometheus 的逻辑
+        // 例如使用 cURL 请求 Prometheus 的 pushgateway 等
+    }
+}
+
+
+==== ./includes/monitoring/certificate-expiry.php ====
+<?php
+// 引入日志记录工具
+require_once plugin_dir_path(__FILE__) . '../utilities/logging.php';
+
+/**
+ * 检查证书到期情况
+ *
+ * 此函数会检查微信和支付宝的证书到期时间，若距离到期时间不足 30 天，会记录错误日志并发送预警邮件。
+ *
+ * @return void
+ */
+function wmpp_check_certificate_expiry() {
+    // 获取微信支付证书路径
+    $wechat_cert_path = wmpp_get_global_config('wmpp_wechat_cert_path', '');
+    // 获取支付宝支付证书路径
+    $alipay_cert_path = wmpp_get_global_config('wmpp_alipay_cert_path', '');
+
+    // 检查微信支付证书
+    if (!empty($wechat_cert_path)) {
+        $wechat_expiry = wmpp_get_certificate_expiry($wechat_cert_path);
+        if ($wechat_expiry) {
+            // 计算距离到期的天数
+            $days_left = floor(($wechat_expiry - time()) / (60 * 60 * 24));
+            if ($days_left <= 30) {
+                $errorInfo = [
+                    'error_type' => 'certificate_expiry',
+                    'error_message' => "微信支付证书即将到期，剩余 $days_left 天",
+                    'cert_path' => $wechat_cert_path
+                ];
+                // 记录错误日志
+                wmpp_log_error(json_encode($errorInfo), 'certificate-expiry');
+                // 发送预警邮件
+                wmpp_send_certificate_expiry_alert($days_left, '微信支付');
+            }
+        }
+    }
+
+    // 检查支付宝支付证书
+    if (!empty($alipay_cert_path)) {
+        $alipay_expiry = wmpp_get_certificate_expiry($alipay_cert_path);
+        if ($alipay_expiry) {
+            // 计算距离到期的天数
+            $days_left = floor(($alipay_expiry - time()) / (60 * 60 * 24));
+            if ($days_left <= 30) {
+                $errorInfo = [
+                    'error_type' => 'certificate_expiry',
+                    'error_message' => "支付宝支付证书即将到期，剩余 $days_left 天",
+                    'cert_path' => $alipay_cert_path
+                ];
+                // 记录错误日志
+                wmpp_log_error(json_encode($errorInfo), 'certificate-expiry');
+                // 发送预警邮件
+                wmpp_send_certificate_expiry_alert($days_left, '支付宝支付');
+            }
+        }
+    }
+}
+
+/**
+ * 获取证书到期时间
+ *
+ * 该函数会读取指定路径的证书文件，解析其到期时间戳。
+ *
+ * @param string $cert_path 证书文件的路径
+ * @return int|false 若成功获取到期时间，返回时间戳；否则返回 false
+ */
+function wmpp_get_certificate_expiry($cert_path) {
+    if (file_exists($cert_path)) {
+        $cert = file_get_contents($cert_path);
+        $cert_info = openssl_x509_parse($cert);
+        if ($cert_info && isset($cert_info['validTo_time_t'])) {
+            return $cert_info['validTo_time_t'];
+        }
+    }
+    return false;
+}
+
+/**
+ * 发送证书到期预警通知
+ *
+ * 当证书即将到期时，此函数会向指定邮箱发送预警邮件。
+ *
+ * @param int $days_left 距离证书到期的剩余天数
+ * @param string $payment_type 支付类型（如 "微信支付" 或 "支付宝支付"）
+ * @return void
+ */
+function wmpp_send_certificate_expiry_alert($days_left, $payment_type) {
+    // 获取预警通知邮箱
+    $alert_email = wmpp_get_global_config('wmpp_certificate_expiry_alert_email', '');
+    if (!empty($alert_email)) {
+        $subject = "证书到期预警 - $payment_type";
+        $message = "$payment_type 证书即将到期，剩余 $days_left 天，请及时更新。";
+        // 发送邮件
+        wp_mail($alert_email, $subject, $message);
+    }
+}
+
+
