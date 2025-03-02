@@ -1,0 +1,2690 @@
+==== ./includes/core/class-settings.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Core_Settings {  
+    const OPTION_GLOBAL_DOMAIN = 'tao_global_payment_domain';  
+
+    /**  
+     * 获取当前站点的支付域名（支持继承全局配置）  
+     * @param int $blog_id 站点ID  
+     * @return string  
+     */  
+    public static function get_payment_domain($blog_id = null) {  
+        $blog_id = $blog_id ?: get_current_blog_id();  
+        $local_domain = get_blog_option($blog_id, 'tao_payment_domain');  
+        return $local_domain ?: get_site_option(self::OPTION_GLOBAL_DOMAIN);  
+    }  
+
+    /**  
+     * 校验HTTPS域名格式  
+     * @param string $domain  
+     * @return bool  
+     */  
+    public static function validate_domain($domain) {  
+        return preg_match('/^https:\/\/[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}$/', $domain);  
+    }  
+
+    /**  
+     * 初始化多语言支持  
+     */  
+    public static function load_i18n() {  
+        load_plugin_textdomain(  
+            'tao-payment',  
+            false,  
+            dirname(plugin_basename(__FILE__)) . '/../../languages/'  
+        );  
+    }  
+
+    /**  
+     * 创建数据库表（插件激活时执行）  
+     */  
+    public static function init_database() {  
+        global $wpdb;  
+        $charset_collate = $wpdb->get_charset_collate();  
+
+        $sql = "  
+            CREATE TABLE IF NOT EXISTS {$wpdb->prefix}tao_payment_config (  
+                blog_id BIGINT UNSIGNED NOT NULL,  
+                wechat_mch_id VARCHAR(32) NOT NULL,  
+                wechat_api_key VARCHAR(256) NOT NULL,  
+                alipay_app_id VARCHAR(32) NOT NULL,  
+                alipay_private_key TEXT NOT NULL,  
+                PRIMARY KEY (blog_id)  
+            ) {$charset_collate};  
+        ";  
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';  
+        dbDelta($sql);  
+    }  
+
+    /**  
+     * 清理插件数据（插件停用时执行）  
+     */  
+    public static function cleanup() {  
+        // 保留全局配置，仅删除子站配置  
+        if (!is_network_admin()) {  
+            delete_option('tao_payment_domain');  
+        }  
+    }  
+}  -e 
+
+
+==== ./includes/core/class-payment-handler.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Payment_Handler {  
+    const PAYMENT_TIMEOUT = 15; // 支付请求超时时间（秒）  
+
+    /**  
+     * 初始化支付处理钩子  
+     */  
+    public static function init() {  
+        add_action('tao_process_payment', [__CLASS__, 'process_payment']);  
+    }  
+
+    /**  
+     * 统一支付请求入口  
+     * @param array $order_data 订单数据（包含金额、渠道、订单号等）  
+     */  
+    public static function process_payment($order_data) {  
+        try {  
+            $payment_channel = $order_data['channel'] ?? 'wechat';  
+            $payment_domain = Tao_Core_Settings::get_payment_domain();  
+
+            // 验证支付域名配置  
+            if (!Tao_Core_Settings::validate_domain($payment_domain)) {  
+                throw new Exception("支付域名未配置或格式错误");  
+            }  
+
+            // 根据渠道分发支付请求  
+            switch ($payment_channel) {  
+                case 'wechat':  
+                    self::handle_wechat_payment($order_data);  
+                    break;  
+                case 'alipay':  
+                    self::handle_alipay_payment($order_data);  
+                    break;  
+                default:  
+                    throw new Exception("不支持的支付渠道: {$payment_channel}");  
+            }  
+
+            Tao_AuditLog::log('payment_request', null, [  
+                'order_id' => $order_data['order_id'],  
+                'amount' => $order_data['amount']  
+            ]);  
+
+        } catch (Exception $e) {  
+            Tao_AuditLog::log('payment_error', null, [  
+                'error' => $e->getMessage(),  
+                'order_id' => $order_data['order_id'] ?? 'unknown'  
+            ]);  
+            throw $e;  
+        }  
+    }  
+
+    /**  
+     * 微信支付处理逻辑  
+     */  
+    private static function handle_wechat_payment($order_data) {  
+        $mch_id = get_option('tao_wechat_mch_id');  
+        $api_key = Tao_KeyRotator::decrypt(get_option('tao_wechat_api_key'));  
+
+        $wechat_pay = new Tao_WeChatPay($mch_id, $api_key);  
+        $code_url = $wechat_pay->create_order(  
+            $order_data['amount'],  
+            $order_data['order_id']  
+        );  
+
+        // 存储支付二维码URL  
+        update_post_meta($order_data['order_id'], '_wechat_pay_url', $code_url);  
+    }  
+
+    /**  
+     * 支付宝支付处理逻辑  
+     */  
+    private static function handle_alipay_payment($order_data) {  
+        $alipay = new Tao_Alipay([  
+            'app_id' => get_option('tao_alipay_app_id'),  
+            'private_key' => Tao_KeyRotator::decrypt(get_option('tao_alipay_private_key'))  
+        ]);  
+
+        $pay_url = $alipay->page_pay([  
+            'out_trade_no' => $order_data['order_id'],  
+            'total_amount' => $order_data['amount']  
+        ]);  
+
+        // 跳转到支付宝支付页面  
+        wp_redirect($pay_url);  
+        exit;  
+    }  
+}  
+
+// 注册支付处理钩子  
+Tao_Payment_Handler::init();  -e 
+
+
+==== ./includes/security/class-permissions.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Permissions {  
+    const CAP_MANAGE_PAYMENT = 'manage_payment_local';  
+    const CAP_VIEW_AUDIT_LOG = 'view_audit_log';  
+
+    /**  
+     * 初始化权限控制钩子  
+     */  
+    public static function init() {  
+        // 注册自定义权限项  
+        add_filter('user_has_cap', [__CLASS__, 'grant_custom_caps'], 10, 4);  
+
+        // 子站管理员权限校验  
+        add_action('admin_init', [__CLASS__, 'check_admin_access']);  
+    }  
+
+    /**  
+     * 动态授予子站管理员权限  
+     */  
+    public static function grant_custom_caps($allcaps, $caps, $args, $user) {  
+        if (is_multisite() && !is_super_admin($user->ID)) {  
+            // 子站管理员默认拥有支付管理权限  
+            $allcaps[self::CAP_MANAGE_PAYMENT] = true;  
+            $allcaps[self::CAP_VIEW_AUDIT_LOG] = true;  
+        }  
+        return $allcaps;  
+    }  
+
+    /**  
+     * 校验用户是否具备操作权限  
+     * @param string $capability 权限标识  
+     * @throws Exception 权限不足时抛出异常  
+     */  
+    public static function validate_capability($capability) {  
+        if (!current_user_can($capability)) {  
+            Tao_AuditLog::log('permission_denied', get_current_user_id(), [  
+                'attempted_cap' => $capability,  
+                'ip' => $_SERVER['REMOTE_ADDR']  
+            ]);  
+            throw new Exception("权限不足: 缺少 {$capability} 权限");  
+        }  
+    }  
+
+    /**  
+     * 阻止子站管理员访问网络级配置  
+     */  
+    public static function check_admin_access() {  
+        if (is_network_admin() && !is_super_admin()) {  
+            wp_die('无权访问网络级配置');  
+        }  
+    }  
+
+    /**  
+     * 分配自定义角色权限（插件激活时调用）  
+     */  
+    public static function assign_roles() {  
+        $role = get_role('shop_manager');  
+        if ($role) {  
+            $role->add_cap(self::CAP_MANAGE_PAYMENT);  
+            $role->add_cap(self::CAP_VIEW_AUDIT_LOG);  
+        }  
+    }  
+}  
+
+// 初始化权限模块  
+Tao_Permissions::init();  -e 
+
+
+==== ./includes/security/class-login-monitor.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_LoginMonitor {  
+    const FAILED_LOGIN_LIMIT = 5;  
+    const BLOCK_TIME = 3600; // 1小时  
+
+    /**  
+     * 记录登录失败尝试  
+     */  
+    public static function track_failed_login($username) {  
+        $ip = $_SERVER['REMOTE_ADDR'];  
+        $transient_key = 'tao_failed_login_' . $ip;  
+
+        // 获取当前失败次数  
+        $attempts = get_transient($transient_key) ?: 0;  
+        $attempts++;  
+
+        // 触发封锁逻辑  
+        if ($attempts >= self::FAILED_LOGIN_LIMIT) {  
+            self::block_ip($ip);  
+            Tao_AuditLog::log('ip_blocked', null, [  
+                'ip' => $ip,  
+                'reason' => '登录失败次数超限'  
+            ]);  
+        }  
+
+        set_transient($transient_key, $attempts, self::BLOCK_TIME);  
+    }  
+
+    /**  
+     * IP封锁逻辑（集成Fail2Ban）  
+     */  
+    private static function block_ip($ip) {  
+        // 更新Fail2Ban规则  
+        $ban_file = '/etc/fail2ban/jail.d/tao-payment.conf';  
+        if (file_exists($ban_file)) {  
+            $rule = "deny $ip;\n";  
+            file_put_contents($ban_file, $rule, FILE_APPEND);  
+        }  
+
+        // 写入WordPress黑名单  
+        update_option('tao_blocked_ips', array_unique(array_merge(  
+            (array)get_option('tao_blocked_ips', []),  
+            [$ip]  
+        )));  
+    }  
+
+    /**  
+     * 校验当前IP是否被封禁  
+     */  
+    public static function is_ip_blocked($ip = null) {  
+        $ip = $ip ?: $_SERVER['REMOTE_ADDR'];  
+        return in_array($ip, (array)get_option('tao_blocked_ips', []));  
+    }  
+}  
+
+// 挂载到WordPress登录失败钩子  
+add_action('wp_login_failed', ['Tao_LoginMonitor', 'track_failed_login']);  -e 
+
+
+==== ./includes/security/class-coldstorage.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_ColdStorage {  
+    const STORAGE_DIR = WP_CONTENT_DIR . '/tao-cold-storage/';  
+    const ENCRYPT_PREFIX = 'ENC_';  
+
+    /**  
+     * 归档历史密钥到加密文件  
+     * @param string $data 需归档的敏感数据  
+     */  
+    public static function archive($data) {  
+        if (!is_dir(self::STORAGE_DIR)) {  
+            wp_mkdir_p(self::STORAGE_DIR);  
+        }  
+
+        $filename = self::ENCRYPT_PREFIX . date('Ymd-His') . '.dat';  
+        $filepath = self::STORAGE_DIR . $filename;  
+
+        // 使用当前激活密钥加密数据  
+        $encrypted = openssl_encrypt(  
+            $data,  
+            'AES-256-GCM',  
+            Tao_KeyRotator::get_current_key(),  
+            0,  
+            $iv = random_bytes(16),  
+            $tag  
+        );  
+
+        // 存储加密内容（IV+Tag+密文）  
+        file_put_contents(  
+            $filepath,  
+            base64_encode($iv . $tag . $encrypted)  
+        );  
+
+        // 设置文件权限  
+        chmod($filepath, 0600);  
+
+        Tao_AuditLog::log('coldstorage_archived', null, [  
+            'filename' => $filename,  
+            'data_type' => 'legacy_key'  
+        ]);  
+    }  
+
+    /**  
+     * 从冷存储恢复数据  
+     * @param string $filename 加密文件名  
+     * @return string 解密后的明文  
+     */  
+    public static function restore($filename) {  
+        $filepath = self::STORAGE_DIR . $filename;  
+        if (!file_exists($filepath)) {  
+            throw new RuntimeException("冷存储文件不存在: $filename");  
+        }  
+
+        $raw = base64_decode(file_get_contents($filepath));  
+        $iv = substr($raw, 0, 16);  
+        $tag = substr($raw, 16, 16);  
+        $ciphertext = substr($raw, 32);  
+
+        return openssl_decrypt(  
+            $ciphertext,  
+            'AES-256-GCM',  
+            Tao_KeyRotator::get_current_key(),  
+            0,  
+            $iv,  
+            $tag  
+        );  
+    }  
+
+    /**  
+     * 清理过期归档文件（超过365天）  
+     */  
+    public static function cleanup_expired() {  
+        foreach (glob(self::STORAGE_DIR . self::ENCRYPT_PREFIX . '*.dat') as $file) {  
+            if (time() - filemtime($file) > 31536000) { // 365天  
+                unlink($file);  
+                Tao_AuditLog::log('coldstorage_cleaned', null, ['filename' => basename($file)]);  
+            }  
+        }  
+    }  
+}  
+
+// 注册每日清理任务  
+add_action('tao_daily_cron', ['Tao_ColdStorage', 'cleanup_expired']);  -e 
+
+
+==== ./includes/security/class-keyrotator.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_KeyRotator {  
+    const ENCRYPT_METHOD = 'AES-256-GCM';  
+    const ROTATION_DAYS = 90;  
+
+    /**  
+     * 加密数据（优先使用HSM）  
+     */  
+    public static function encrypt($data) {  
+        if (self::use_hsm()) {  
+            return HSM_Client::encrypt($data);  
+        }  
+        return self::software_encrypt($data);  
+    }  
+
+    /**  
+     * 解密数据（自动检测HSM加密）  
+     */  
+    public static function decrypt($ciphertext) {  
+        if (self::is_hsm_ciphertext($ciphertext)) {  
+            return HSM_Client::decrypt($ciphertext);  
+        }  
+        return self::software_decrypt($ciphertext);  
+    }  
+
+    /**  
+     * 密钥轮换定时任务  
+     */  
+    public static function rotate_keys() {  
+        $current_key = get_option('tao_current_key');  
+        $legacy_key = get_option('tao_legacy_key');  
+
+        // 归档旧密钥  
+        if ($legacy_key) {  
+            Tao_ColdStorage::archive($legacy_key);  
+        }  
+
+        // 生成新密钥  
+        $new_key = bin2hex(random_bytes(32));  
+        update_option('tao_legacy_key', $current_key);  
+        update_option('tao_current_key', $new_key);  
+
+        Tao_AuditLog::log('key_rotated', null, [  
+            'rotation_time' => current_time('mysql')  
+        ]);  
+    }  
+
+    /**  
+     * 软件加密实现（AES-256-GCM）  
+     */  
+    private static function software_encrypt($data) {  
+        $key = self::get_current_key();  
+        $iv = random_bytes(openssl_cipher_iv_length(self::ENCRYPT_METHOD));  
+        $tag = '';  
+        $ciphertext = openssl_encrypt($data, self::ENCRYPT_METHOD, $key, 0, $iv, $tag);  
+        return base64_encode($iv . $tag . $ciphertext);  
+    }  
+
+    /**  
+     * 判断是否为HSM加密数据  
+     */  
+    private static function is_hsm_ciphertext($str) {  
+        return strpos($str, 'HSM_') === 0;  
+    }  
+
+    /**  
+     * 是否启用HSM  
+     */  
+    private static function use_hsm() {  
+        return defined('TAO_USE_HSM') && TAO_USE_HSM;  
+    }  
+}  
+
+// 注册每日密钥轮换检查  
+add_action('tao_daily_cron', ['Tao_KeyRotator', 'rotate_keys']);  -e 
+
+
+==== ./includes/payment/alipay/class-alipay-sdk.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Alipay {  
+    const API_GATEWAY = 'https://openapi.alipay.com/gateway.do';  
+    private $app_id;  
+    private $private_key;  
+    private $public_key;  
+
+    public function __construct($config) {  
+        $this->app_id      = $config['app_id'];  
+        $this->private_key = $config['private_key'];  
+        $this->public_key  = $config['public_key'];  
+    }  
+
+    /**  
+     * 生成电脑网站支付链接  
+     * @param array $order_data 订单数据（必须包含out_trade_no、total_amount）  
+     * @return string 支付跳转URL  
+     */  
+    public function page_pay($order_data) {  
+        $params = [  
+            'app_id'      => $this->app_id,  
+            'method'      => 'alipay.trade.page.pay',  
+            'charset'     => 'UTF-8',  
+            'sign_type'   => 'RSA2',  
+            'timestamp'   => date('Y-m-d H:i:s'),  
+            'version'     => '1.0',  
+            'biz_content' => json_encode(array_merge(  
+                ['product_code' => 'FAST_INSTANT_TRADE_PAY'],  
+                $order_data  
+            ))  
+        ];  
+
+        // 生成签名并构造请求URL  
+        $params['sign'] = $this->generate_signature($params);  
+        return self::API_GATEWAY . '?' . http_build_query($params);  
+    }  
+
+    /**  
+     * 支付宝回调验签  
+     * @param array $data 回调参数  
+     * @return bool  
+     */  
+    public function verify_callback($data) {  
+        $sign = $data['sign'];  
+        unset($data['sign'], $data['sign_type']);  
+        ksort($data);  
+
+        $str = urldecode(http_build_query($data));  
+        return openssl_verify(  
+            $str,  
+            base64_decode($sign),  
+            $this->public_key,  
+            OPENSSL_ALGO_SHA256  
+        ) === 1;  
+    }  
+
+    /**  
+     * 生成RSA2签名  
+     */  
+    private function generate_signature($params) {  
+        ksort($params);  
+        $str = urldecode(http_build_query($params));  
+        openssl_sign($str, $sign, $this->private_key, OPENSSL_ALGO_SHA256);  
+        return base64_encode($sign);  
+    }  
+}  -e 
+
+
+==== ./includes/payment/wechat/class-wechat-sdk.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_WeChatPay {  
+    const API_BASE_URL = 'https://api.mch.weixin.qq.com/v3';  
+    private $mch_id;  
+    private $api_key;  
+    private $cert_path;  
+
+    public function __construct($mch_id, $api_key, $cert_path = '') {  
+        $this->mch_id = $mch_id;  
+        $this->api_key = $api_key;  
+        $this->cert_path = $cert_path ?: get_option('tao_wechat_cert_path');  
+
+        if (!file_exists($this->cert_path)) {  
+            throw new RuntimeException("微信支付证书文件不存在: " . $this->cert_path);  
+        }  
+    }  
+
+    /**  
+     * 创建Native支付订单  
+     * @param float $amount 金额（单位：元）  
+     * @param string $out_trade_no 商户订单号  
+     * @return string 支付二维码链接  
+     */  
+    public function create_order($amount, $out_trade_no) {  
+        $url = self::API_BASE_URL . '/pay/transactions/native';  
+        $data = [  
+            'mchid' => $this->mch_id,  
+            'out_trade_no' => $out_trade_no,  
+            'amount' => [  
+                'total' => intval($amount * 100),  
+                'currency' => 'CNY'  
+            ],  
+            'notify_url' => Tao_Core_Settings::get_payment_domain() . '/wp-json/tao-payment/v1/callback/wechat'  
+        ];  
+
+        $response = $this->signed_request('POST', $url, $data);  
+        return $response['code_url'] ?? '';  
+    }  
+
+    /**  
+     * 带证书和签名的HTTP请求  
+     */  
+    private function signed_request($method, $url, $data) {  
+        $timestamp = time();  
+        $nonce = md5(uniqid());  
+        $body = json_encode($data);  
+        $message = "$method\n$url\n$timestamp\n$nonce\n$body";  
+
+        // 生成HMAC-SHA256签名  
+        $signature = hash_hmac('sha256', $message, $this->api_key);  
+
+        $headers = [  
+            'Content-Type: application/json',  
+            'Authorization: WECHATPAY2-SHA256-RSA2048 ' . implode(',', [  
+                'mchid="' . $this->mch_id . '"',  
+                'nonce_str="' . $nonce . '"',  
+                'timestamp="' . $timestamp . '"',  
+                'serial_no="' . $this->get_cert_serial() . '"',  
+                'signature="' . $signature . '"'  
+            ])  
+        ];  
+
+        $ch = curl_init();  
+        curl_setopt_array($ch, [  
+            CURLOPT_URL => $url,  
+            CURLOPT_HTTPHEADER => $headers,  
+            CURLOPT_SSLCERT => $this->cert_path,  
+            CURLOPT_SSLKEY => $this->cert_path,  
+            CURLOPT_POST => $method === 'POST',  
+            CURLOPT_POSTFIELDS => $body,  
+            CURLOPT_RETURNTRANSFER => true  
+        ]);  
+
+        $result = curl_exec($ch);  
+        if (curl_errno($ch)) {  
+            Tao_AuditLog::log('wechat_request_error', null, [  
+                'error' => curl_error($ch),  
+                'url' => $url  
+            ]);  
+            throw new RuntimeException("微信支付接口请求失败");  
+        }  
+
+        return json_decode($result, true);  
+    }  
+
+    /**  
+     * 从证书提取序列号  
+     */  
+    private function get_cert_serial() {  
+        $cert = openssl_x509_parse(file_get_contents($this->cert_path));  
+        return $cert['serialNumberHex'] ?? '';  
+    }  
+}  -e 
+
+
+==== ./includes/payment/wechat/hsm/class-hsm-client.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class HSM_Client {  
+    const HSM_KEY_ARN = 'arn:aws:kms:us-west-2:123456789012:key/your-key-id'; // AWS KMS密钥ARN  
+
+    /**  
+     * 使用HSM加密数据  
+     * @param string $plaintext 明文数据  
+     * @return string Base64编码的密文  
+     * @throws Exception 加密失败时抛出异常  
+     */  
+    public static function encrypt($plaintext) {  
+        try {  
+            $kms = new Aws\Kms\KmsClient([  
+                'version' => 'latest',  
+                'region'  => 'us-west-2'  
+            ]);  
+
+            $result = $kms->encrypt([  
+                'KeyId'     => self::HSM_KEY_ARN,  
+                'Plaintext' => $plaintext,  
+                'EncryptionAlgorithm' => 'SYMMETRIC_DEFAULT'  
+            ]);  
+
+            return base64_encode($result['CiphertextBlob']);  
+        } catch (Aws\Exception\AwsException $e) {  
+            Tao_AuditLog::log('hsm_error', null, [  
+                'operation' => 'encrypt',  
+                'error' => $e->getAwsErrorMessage()  
+            ]);  
+            throw new RuntimeException("HSM加密失败: " . $e->getMessage());  
+        }  
+    }  
+
+    /**  
+     * 使用HSM解密数据  
+     * @param string $ciphertext Base64编码的密文  
+     * @return string 解密后的明文  
+     * @throws Exception 解密失败时抛出异常  
+     */  
+    public static function decrypt($ciphertext) {  
+        try {  
+            $kms = new Aws\Kms\KmsClient([  
+                'version' => 'latest',  
+                'region'  => 'us-west-2'  
+            ]);  
+
+            $result = $kms->decrypt([  
+                'CiphertextBlob' => base64_decode($ciphertext),  
+                'KeyId' => self::HSM_KEY_ARN,  
+                'EncryptionAlgorithm' => 'SYMMETRIC_DEFAULT'  
+            ]);  
+
+            return $result['Plaintext'];  
+        } catch (Aws\Exception\AwsException $e) {  
+            Tao_AuditLog::log('hsm_error', null, [  
+                'operation' => 'decrypt',  
+                'error' => $e->getAwsErrorMessage()  
+            ]);  
+            throw new RuntimeException("HSM解密失败: " . $e->getMessage());  
+        }  
+    }  
+
+    /**  
+     * 生成数据密钥（用于本地加密）  
+     * @return array ['CiphertextBlob' => 加密的密钥, 'Plaintext' => 明文密钥]  
+     */  
+    public static function generate_data_key() {  
+        try {  
+            $kms = new Aws\Kms\KmsClient([  
+                'version' => 'latest',  
+                'region'  => 'us-west-2'  
+            ]);  
+
+            $result = $kms->generateDataKey([  
+                'KeyId' => self::HSM_KEY_ARN,  
+                'KeySpec' => 'AES_256'  
+            ]);  
+
+            return [  
+                'ciphertext' => base64_encode($result['CiphertextBlob']),  
+                'plaintext'  => base64_encode($result['Plaintext'])  
+            ];  
+        } catch (Aws\Exception\AwsException $e) {  
+            throw new RuntimeException("HSM生成数据密钥失败: " . $e->getMessage());  
+        }  
+    }  
+}  
+
+// 自动加载AWS SDK（需确保vendor依赖已安装）  
+if (!class_exists('Aws\Kms\KmsClient')) {  
+    require_once plugin_dir_path(__FILE__) . '../../../vendor/autoload.php';  
+}-e 
+
+
+==== ./includes/payment/class-callback-handler.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Callback_Handler {  
+    const MAX_RETRIES = 3;  
+    const RETRY_INTERVAL = 10; // 秒  
+
+    /**  
+     * 微信支付回调处理（含签名校验）  
+     */  
+    public static function handle_wechat_callback(WP_REST_Request $request) {  
+        try {  
+            // 获取原始数据并验证签名  
+            $raw_data = $request->get_body();  
+            $headers = $request->get_headers();  
+            $signature = $headers['wechatpay-signature'] ?? '';  
+
+            if (!self::verify_wechat_signature($raw_data, $signature)) {  
+                throw new Exception("HMAC-SHA256签名校验失败");  
+            }  
+
+            // 解析订单数据  
+            $data = json_decode($raw_data, true);  
+            $order_id = $data['out_trade_no'] ?? '';  
+            $status = $data['trade_state'] ?? '';  
+
+            // 处理支付结果  
+            if ($status === 'SUCCESS') {  
+                self::mark_order_paid($order_id);  
+                Tao_AuditLog::log('payment_success', null, [  
+                    'order_id' => $order_id,  
+                    'amount' => $data['amount']['total'] / 100  
+                ]);  
+                return new WP_REST_Response(['code' => 'SUCCESS'], 200);  
+            }  
+
+            // 失败时触发重试机制  
+            $retry_count = get_post_meta($order_id, '_retry_count', true) ?: 0;  
+            if ($retry_count < self::MAX_RETRIES) {  
+                wp_schedule_single_event(time() + self::RETRY_INTERVAL, 'tao_retry_callback', [$order_id]);  
+                update_post_meta($order_id, '_retry_count', $retry_count + 1);  
+            }  
+
+            return new WP_REST_Response(['code' => 'FAIL'], 400);  
+
+        } catch (Exception $e) {  
+            Tao_AuditLog::log('callback_error', null, [  
+                'error' => $e->getMessage(),  
+                'raw_data' => $raw_data  
+            ]);  
+            return new WP_REST_Response(['code' => 'SYSTEMERROR'], 500);  
+        }  
+    }  
+
+    /**  
+     * HMAC-SHA256签名校验  
+     */  
+    private static function verify_wechat_signature($data, $signature) {  
+        $api_key = Tao_KeyRotator::decrypt(get_option('tao_wechat_api_key'));  
+        $calculated_sign = hash_hmac('sha256', $data, $api_key);  
+        return hash_equals($calculated_sign, $signature);  
+    }  
+
+    /**  
+     * 标记订单为已支付  
+     */  
+    private static function mark_order_paid($order_id) {  
+        update_post_meta($order_id, '_payment_status', 'paid');  
+        do_action('tao_payment_completed', $order_id);  
+    }  
+
+    /**  
+     * 支付宝回调处理  
+     */  
+    public static function handle_alipay_callback(WP_REST_Request $request) {  
+        // 实现逻辑类似微信支付  
+    }  
+}  -e 
+
+
+==== ./includes/admin/class-admin-scripts.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Admin_Scripts {  
+    /**
+     * 注册前端脚本与翻译资源
+     */
+    public static function enqueue_scripts() {  
+        // 注册核心脚本  
+        wp_register_script(  
+            'tao-payment-admin',  
+            plugins_url('assets/js/admin.js', dirname(__FILE__)),  
+            ['jquery'],  
+            '1.0.0',  
+            true  
+        );  
+
+        // 注入当前语言环境与翻译字典  
+        $locale = get_locale();  
+        $translations = self::get_frontend_translations($locale);  
+        wp_localize_script('tao-payment-admin', 'tao_i18n', [  
+            'locale' => $locale,  
+            'strings' => $translations  
+        ]);  
+
+        // 加载脚本  
+        wp_enqueue_script('tao-payment-admin');  
+    }  
+
+    /**
+     * 获取前端翻译字典（从PO文件动态加载）
+     */
+    private static function get_frontend_translations($locale) {  
+        $translations = [];  
+        $po_file = WP_LANG_DIR . "/plugins/tao-payment-{$locale}.po";  
+
+        if (file_exists($po_file)) {  
+            $po_contents = file_get_contents($po_file);  
+            preg_match_all('/msgid "(.+)"\nmsgstr "(.+)"/', $po_contents, $matches);  
+            foreach ($matches as $index => $msgid) {  
+                $translations[$msgid] = $matches[$index];  
+            }  
+        }  
+
+        return $translations;  
+    }  
+}  
+
+// 挂载到管理后台脚本加载钩子  
+add_action('admin_enqueue_scripts', ['Tao_Admin_Scripts', 'enqueue_scripts']);  -e 
+
+
+==== ./includes/admin/class-setup-wizard.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Setup_Wizard {  
+    /**  
+     * 初始化配置向导  
+     */  
+    public static function init() {  
+        add_action('admin_menu', [__CLASS__, 'add_wizard_page']);  
+    }  
+
+    /**  
+     * 添加向导页面  
+     */  
+    public static function add_wizard_page() {  
+        add_dashboard_page(  
+            __('支付配置向导', 'tao-payment'),  
+            __('支付配置向导', 'tao-payment'),  
+            'manage_options',  
+            'tao-payment-wizard',  
+            [__CLASS__, 'render_wizard']  
+        );  
+    }  
+
+    /**  
+     * 渲染向导界面  
+     */  
+    public static function render_wizard() {  
+        // 分步表单实现（HTML模板略）  
+    }  
+}  
+Tao_Setup_Wizard::init();  -e 
+
+
+==== ./includes/admin/views/audit-logs.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+// 审计日志界面模板  
+?>  
+<div class="wrap tao-audit-logs">  
+    <h1><?php esc_html_e('审计日志', 'tao-payment'); ?></h1>  
+    
+    <div class="filter-section">  
+        <input type="date" id="start-date" name="start_date">  
+        <input type="date" id="end-date" name="end_date">  
+        <select id="log-type">  
+            <option value="all"><?php esc_html_e('全部类型', 'tao-payment'); ?></option>  
+            <option value="payment_success"><?php esc_html_e('支付成功', 'tao-payment'); ?></option>  
+            <option value="payment_error"><?php esc_html_e('支付失败', 'tao-payment'); ?></option>  
+        </select>  
+        <button id="filter-logs" class="button"><?php esc_html_e('筛选', 'tao-payment'); ?></button>  
+    </div>  
+
+    <table class="wp-list-table widefat fixed striped">  
+        <thead>  
+            <tr>  
+                <th><?php esc_html_e('时间', 'tao-payment'); ?></th>  
+                <th><?php esc_html_e('操作类型', 'tao-payment'); ?></th>  
+                <th><?php esc_html_e('用户', 'tao-payment'); ?></th>  
+                <th><?php esc_html_e('IP地址', 'tao-payment'); ?></th>  
+                <th><?php esc_html_e('详情', 'tao-payment'); ?></th>  
+            </tr>  
+        </thead>  
+        <tbody id="audit-log-entries"></tbody>  
+    </table>  
+</div>  -e 
+
+
+==== ./includes/admin/views/setup-wizard.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Setup_Wizard {  
+    public static function render() {  
+        ?>  
+        <div class="wrap tao-wizard">  
+            <h1><?php _e('支付配置向导', 'tao-payment'); ?></h1>  
+            <div class="progress-bar">  
+                <div class="step active" data-step="1">基础配置</div>  
+                <div class="step" data-step="2">微信支付</div>  
+                <div class="step" data-step="3">支付宝</div>  
+            </div>  
+
+            <form id="tao-setup-form">  
+                <!-- 步骤1 -->  
+                <div class="step-content" data-step="1">  
+                    <label>支付域名：  
+                        <input type="url" name="payment_domain" required pattern="^https://.*">  
+                    </label>  
+                </div>  
+
+                <!-- 步骤2 -->  
+                <div class="step-content" data-step="2">  
+                    <label>微信商户号：  
+                        <input type="text" name="wechat_mch_id" required>  
+                    </label>  
+                </div>  
+
+                <!-- 步骤3 -->  
+                <div class="step-content" data-step="3">  
+                    <label>支付宝应用ID：  
+                        <input type="text" name="alipay_app_id" required>  
+                    </label>  
+                </div>  
+            </form>  
+        </div>  
+        <?php  
+    }  
+}  -e 
+
+
+==== ./includes/logs/class-auditlog.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_AuditLog {  
+    const LOG_TABLE = 'tao_audit_logs';  
+
+    /**  
+     * 记录审计日志（自动脱敏）  
+     */  
+    public static function log($action_type, $user_id = null, $details = []) {  
+        global $wpdb;  
+
+        // 敏感字段过滤  
+        $details = self::sanitize_details($details);  
+
+        $wpdb->insert(self::LOG_TABLE, [  
+            'user_id' => $user_id ?? get_current_user_id(),  
+            'action_type' => $action_type,  
+            'ip' => self::mask_ip($_SERVER['REMOTE_ADDR']),  
+            'details' => json_encode($details),  
+            'timestamp' => current_time('mysql')  
+        ]);  
+    }  
+
+    /**  
+     * IP地址脱敏处理  
+     */  
+    private static function mask_ip($ip) {  
+        return preg_replace('/\.(\d+)$/', '.x', $ip);  
+    }  
+
+    /**  
+     * 敏感字段过滤规则  
+     */  
+    private static function sanitize_details($details) {  
+        $sensitive_keys = ['api_key', 'private_key', 'password'];  
+        foreach ($sensitive_keys as $key) {  
+            if (isset($details[$key])) {  
+                $details[$key] = '******';  
+            }  
+        }  
+        return $details;  
+    }  
+
+    /**  
+     * 查询日志（权限校验）  
+     */  
+    public static function query_logs($args) {  
+        Tao_Permissions::validate_capability(Tao_Permissions::CAP_VIEW_AUDIT_LOG);  
+
+        global $wpdb;  
+        return $wpdb->get_results($wpdb->prepare("  
+            SELECT * FROM {$wpdb->prefix}tao_audit_logs  
+            WHERE timestamp >= %s AND timestamp <= %s  
+            ORDER BY id DESC  
+            LIMIT %d  
+        ", $args['start'], $args['end'], $args['limit']));  
+    }  
+}  -e 
+
+
+==== ./includes/logs/class-logexporter.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_LogExporter {  
+
+    /**  
+     * 导出CSV文件  
+     */  
+    public static function export_csv($logs) {  
+        header('Content-Type: text/csv');  
+        header('Content-Disposition: attachment; filename="audit_logs.csv"');  
+
+        $fp = fopen('php://output', 'w');  
+        fputcsv($fp, ['时间', '操作类型', '用户ID', 'IP地址', '详情']);  
+
+        foreach ($logs as $log) {  
+            fputcsv($fp, [  
+                $log->timestamp,  
+                $log->action_type,  
+                $log->user_id,  
+                $log->ip,  
+                json_decode($log->details)  
+            ]);  
+        }  
+        fclose($fp);  
+        exit;  
+    }  
+
+    /**  
+     * 生成PDF报告  
+     */  
+    public static function generate_pdf($logs) {  
+        require_once plugin_dir_path(__FILE__) . '../../vendor/autoload.php';  
+
+        $mpdf = new \Mpdf\Mpdf();  
+        $html = '<h1>审计日志报告</h1>';  
+        $html .= '<table border="1">  
+            <tr><th>时间</th><th>操作类型</th><th>用户</th><th>IP</th><th>详情</th></tr>';  
+
+        foreach ($logs as $log) {  
+            $html .= sprintf('<tr>  
+                <td>%s</td>  
+                <td>%s</td>  
+                <td>%d</td>  
+                <td>%s</td>  
+                <td>%s</td>  
+            </tr>',  
+                $log->timestamp,  
+                $log->action_type,  
+                $log->user_id,  
+                $log->ip,  
+                json_encode(json_decode($log->details), JSON_PRETTY_PRINT)  
+            );  
+        }  
+        $html .= '</table>';  
+
+        $mpdf->WriteHTML($html);  
+        $mpdf->Output('audit_logs.pdf', 'D');  
+        exit;  
+    }  
+}  -e 
+
+
+==== ./includes/monitoring/class-prometheus.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Prometheus {  
+    const PUSH_GATEWAY = 'http://prometheus:9091/metrics/job/tao_payment';  
+
+    /**  
+     * 上报支付成功率指标  
+     */  
+    public static function push_success_rate($rate) {  
+        $metrics = "# HELP tao_payment_success_rate 支付成功率\n";  
+        $metrics .= "# TYPE tao_payment_success_rate gauge\n";  
+        $metrics .= "tao_payment_success_rate $rate\n";  
+
+        wp_remote_post(self::PUSH_GATEWAY, [  
+            'body' => $metrics,  
+            'headers' => ['Content-Type' => 'text/plain']  
+        ]);  
+    }  
+
+    /**  
+     * 上报自定义指标  
+     */  
+    public static function push_metric($name, $value, $labels = []) {  
+        $label_str = '';  
+        foreach ($labels as $k => $v) {  
+            $label_str .= "$k=\"$v\",";  
+        }  
+        $label_str = rtrim($label_str, ',');  
+
+        $metrics = "# HELP tao_$name Custom metric\n";  
+        $metrics .= "# TYPE tao_$name gauge\n";  
+        $metrics .= "tao_$name{$label_str} $value\n";  
+
+        wp_remote_post(self::PUSH_GATEWAY, [  
+            'body' => $metrics,  
+            'headers' => ['Content-Type' => 'text/plain']  
+        ]);  
+    }  
+}  -e 
+
+
+==== ./includes/monitoring/class-healthcheck.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_HealthCheck {  
+    const CERT_EXPIRE_THRESHOLD = 7 * 86400; // 7天  
+
+    /**  
+     * 扫描支付证书有效期  
+     */  
+    public static function check_cert_expiry() {  
+        $alerts = [];  
+
+        // 检查微信证书  
+        $wechat_cert = get_option('tao_wechat_cert_path');  
+        if ($wechat_cert && file_exists($wechat_cert)) {  
+            $expiry = self::get_pem_expiry($wechat_cert);  
+            if ($expiry - time() < self::CERT_EXPIRE_THRESHOLD) {  
+                $alerts[] = "微信证书将在" . date('Y-m-d', $expiry) . "过期";  
+            }  
+        }  
+
+        // 检查支付宝证书  
+        $alipay_cert = get_option('tao_alipay_cert_path');  
+        if ($alipay_cert && file_exists($alipay_cert)) {  
+            $expiry = self::get_pem_expiry($alipay_cert);  
+            if ($expiry - time() < self::CERT_EXPIRE_THRESHOLD) {  
+                $alerts[] = "支付宝证书将在" . date('Y-m-d', $expiry) . "过期";  
+            }  
+        }  
+
+        // 触发报警  
+        if (!empty($alerts)) {  
+            self::send_alert(implode("\n", $alerts));  
+        }  
+    }  
+
+    /**  
+     * 计算支付延迟P99  
+     */  
+    public static function calculate_p99_latency() {  
+        global $wpdb;  
+        $results = $wpdb->get_results("  
+            SELECT request_time FROM {$wpdb->prefix}tao_payment_logs  
+            WHERE created_at > NOW() - INTERVAL 1 HOUR  
+            ORDER BY request_time DESC  
+            LIMIT 1000  
+        ");  
+
+        $latencies = array_column($results, 'request_time');  
+        $p99 = round(percentile($latencies, 0.99), 2);  
+
+        // 上报Prometheus  
+        Tao_Prometheus::push_metric('payment_latency_p99', $p99);  
+        return $p99;  
+    }  
+
+    /**  
+     * 获取PEM证书过期时间  
+     */  
+    private static function get_pem_expiry($path) {  
+        $cert = openssl_x509_parse(file_get_contents($path));  
+        return $cert['validTo_time_t'] ?? 0;  
+    }  
+}  
+
+// 注册定时任务  
+add_action('tao_hourly_cron', ['Tao_HealthCheck', 'check_cert_expiry']);  
+add_action('tao_hourly_cron', ['Tao_HealthCheck', 'calculate_p99_latency']);  -e 
+
+
+==== ./assets/css/admin.css ====
+/* 后台管理界面样式 */  
+.tao-wizard {  
+    max-width: 800px;  
+    margin: 20px auto;  
+    padding: 20px;  
+    background: #fff;  
+    border-radius: 4px;  
+}  
+
+.wizard-steps {  
+    display: flex;  
+    margin-bottom: 30px;  
+}  
+.wizard-steps .step {  
+    flex: 1;  
+    text-align: center;  
+    padding: 10px;  
+    border-bottom: 2px solid #ddd;  
+    color: #666;  
+}  
+.wizard-steps .step.active {  
+    border-color: #0073aa;  
+    color: #0073aa;  
+}  
+
+.step-content.hidden {  
+    display: none;  
+}  
+
+.tao-audit-logs .filter-section {  
+    margin-bottom: 20px;  
+}  
+.tao-audit-logs input, .tao-audit-logs select {  
+    margin-right: 10px;  
+}  
+
+.validation-error {  
+    color: #dc3232;  
+    font-size: 0.9em;  
+    margin-top: 5px;  
+}  -e 
+
+
+==== ./assets/js/tao-i18n.js ====
+/**
+ * 前端国际化模块（动态加载翻译资源）
+ * @version 1.0.0
+ */
+const TaoI18n = (function() {
+    let translations = {};
+  
+    // 初始化翻译字典（通过WordPress注入）
+    function init(locale = 'en_US') {
+      const i18nData = window.tao_i18n || {};
+      translations = i18nData[locale] || i18nData['en_US'] || {};
+    }
+  
+    /**
+     * 获取翻译字符串（支持动态参数）
+     * @param {string} key - 翻译键名
+     * @param {...any} args - 动态参数（可选）
+     * @returns {string} 翻译后的字符串
+     */
+    function t(key, ...args) {
+      let text = translations[key] || key;
+      args.forEach((arg, index) => {
+        text = text.replace(new RegExp(`\\{${index}\\}`, 'g'), arg);
+      });
+      return text;
+    }
+  
+    return { init, t };
+  })();
+  
+  // 默认根据WordPress语言环境初始化
+  document.addEventListener('DOMContentLoaded', () => {
+    TaoI18n.init(window.tao_locale || 'en_US');
+  });-e 
+
+
+==== ./assets/js/admin-validation.js ====
+document.addEventListener('DOMContentLoaded', function() {  
+    // 支付域名校验  
+    const domainInput = document.querySelector('input[name="payment_domain"]');  
+    if (domainInput) {  
+        domainInput.addEventListener('blur', function(e) {  
+            const isValid = /^https:\/\/[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}$/.test(e.target.value);  
+            showValidationMessage(e.target, isValid, '域名必须为有效的HTTPS地址');  
+        });  
+    }  
+
+    // 支付宝私钥校验  
+    document.querySelectorAll('textarea[name="alipay_private_key"]').forEach(input => {  
+        input.addEventListener('input', function(e) {  
+            const key = e.target.value.trim();  
+            const isValid = key.startsWith('-----BEGIN RSA PRIVATE KEY-----') &&  
+                            key.endsWith('-----END RSA PRIVATE KEY-----');  
+            showValidationMessage(e.target, isValid, '必须为RSA私钥PEM格式');  
+        });  
+    });  
+
+    // 微信证书上传校验  
+    const wechatCertInput = document.querySelector('input[name="wechat_cert"]');  
+    if (wechatCertInput) {  
+        wechatCertInput.addEventListener('change', function(e) {  
+            const file = e.target.files;  
+            const isValid = file?.name.endsWith('.pem');  
+            showValidationMessage(e.target, isValid, '必须选择.pem格式的证书文件');  
+        });  
+    }  
+
+    function showValidationMessage(element, isValid, errorMsg) {  
+        const errorSpan = element.parentElement.querySelector('.validation-error');  
+        if (!errorSpan) {  
+            const span = document.createElement('span');  
+            span.className = 'validation-error tao-error';  
+            element.parentElement.appendChild(span);  
+        }  
+        element.parentElement.querySelector('.validation-error').textContent = isValid ? '' : errorMsg;  
+    }  
+});  -e 
+
+
+==== ./includes/core/class-settings.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Core_Settings {  
+    const OPTION_GLOBAL_DOMAIN = 'tao_global_payment_domain';  
+
+    /**  
+     * 获取当前站点的支付域名（支持继承全局配置）  
+     * @param int $blog_id 站点ID  
+     * @return string  
+     */  
+    public static function get_payment_domain($blog_id = null) {  
+        $blog_id = $blog_id ?: get_current_blog_id();  
+        $local_domain = get_blog_option($blog_id, 'tao_payment_domain');  
+        return $local_domain ?: get_site_option(self::OPTION_GLOBAL_DOMAIN);  
+    }  
+
+    /**  
+     * 校验HTTPS域名格式  
+     * @param string $domain  
+     * @return bool  
+     */  
+    public static function validate_domain($domain) {  
+        return preg_match('/^https:\/\/[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}$/', $domain);  
+    }  
+
+    /**  
+     * 初始化多语言支持  
+     */  
+    public static function load_i18n() {  
+        load_plugin_textdomain(  
+            'tao-payment',  
+            false,  
+            dirname(plugin_basename(__FILE__)) . '/../../languages/'  
+        );  
+    }  
+
+    /**  
+     * 创建数据库表（插件激活时执行）  
+     */  
+    public static function init_database() {  
+        global $wpdb;  
+        $charset_collate = $wpdb->get_charset_collate();  
+
+        $sql = "  
+            CREATE TABLE IF NOT EXISTS {$wpdb->prefix}tao_payment_config (  
+                blog_id BIGINT UNSIGNED NOT NULL,  
+                wechat_mch_id VARCHAR(32) NOT NULL,  
+                wechat_api_key VARCHAR(256) NOT NULL,  
+                alipay_app_id VARCHAR(32) NOT NULL,  
+                alipay_private_key TEXT NOT NULL,  
+                PRIMARY KEY (blog_id)  
+            ) {$charset_collate};  
+        ";  
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';  
+        dbDelta($sql);  
+    }  
+
+    /**  
+     * 清理插件数据（插件停用时执行）  
+     */  
+    public static function cleanup() {  
+        // 保留全局配置，仅删除子站配置  
+        if (!is_network_admin()) {  
+            delete_option('tao_payment_domain');  
+        }  
+    }  
+}  -e 
+
+
+==== ./includes/core/class-payment-handler.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Payment_Handler {  
+    const PAYMENT_TIMEOUT = 15; // 支付请求超时时间（秒）  
+
+    /**  
+     * 初始化支付处理钩子  
+     */  
+    public static function init() {  
+        add_action('tao_process_payment', [__CLASS__, 'process_payment']);  
+    }  
+
+    /**  
+     * 统一支付请求入口  
+     * @param array $order_data 订单数据（包含金额、渠道、订单号等）  
+     */  
+    public static function process_payment($order_data) {  
+        try {  
+            $payment_channel = $order_data['channel'] ?? 'wechat';  
+            $payment_domain = Tao_Core_Settings::get_payment_domain();  
+
+            // 验证支付域名配置  
+            if (!Tao_Core_Settings::validate_domain($payment_domain)) {  
+                throw new Exception("支付域名未配置或格式错误");  
+            }  
+
+            // 根据渠道分发支付请求  
+            switch ($payment_channel) {  
+                case 'wechat':  
+                    self::handle_wechat_payment($order_data);  
+                    break;  
+                case 'alipay':  
+                    self::handle_alipay_payment($order_data);  
+                    break;  
+                default:  
+                    throw new Exception("不支持的支付渠道: {$payment_channel}");  
+            }  
+
+            Tao_AuditLog::log('payment_request', null, [  
+                'order_id' => $order_data['order_id'],  
+                'amount' => $order_data['amount']  
+            ]);  
+
+        } catch (Exception $e) {  
+            Tao_AuditLog::log('payment_error', null, [  
+                'error' => $e->getMessage(),  
+                'order_id' => $order_data['order_id'] ?? 'unknown'  
+            ]);  
+            throw $e;  
+        }  
+    }  
+
+    /**  
+     * 微信支付处理逻辑  
+     */  
+    private static function handle_wechat_payment($order_data) {  
+        $mch_id = get_option('tao_wechat_mch_id');  
+        $api_key = Tao_KeyRotator::decrypt(get_option('tao_wechat_api_key'));  
+
+        $wechat_pay = new Tao_WeChatPay($mch_id, $api_key);  
+        $code_url = $wechat_pay->create_order(  
+            $order_data['amount'],  
+            $order_data['order_id']  
+        );  
+
+        // 存储支付二维码URL  
+        update_post_meta($order_data['order_id'], '_wechat_pay_url', $code_url);  
+    }  
+
+    /**  
+     * 支付宝支付处理逻辑  
+     */  
+    private static function handle_alipay_payment($order_data) {  
+        $alipay = new Tao_Alipay([  
+            'app_id' => get_option('tao_alipay_app_id'),  
+            'private_key' => Tao_KeyRotator::decrypt(get_option('tao_alipay_private_key'))  
+        ]);  
+
+        $pay_url = $alipay->page_pay([  
+            'out_trade_no' => $order_data['order_id'],  
+            'total_amount' => $order_data['amount']  
+        ]);  
+
+        // 跳转到支付宝支付页面  
+        wp_redirect($pay_url);  
+        exit;  
+    }  
+}  
+
+// 注册支付处理钩子  
+Tao_Payment_Handler::init();  -e 
+
+
+==== ./includes/security/class-permissions.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Permissions {  
+    const CAP_MANAGE_PAYMENT = 'manage_payment_local';  
+    const CAP_VIEW_AUDIT_LOG = 'view_audit_log';  
+
+    /**  
+     * 初始化权限控制钩子  
+     */  
+    public static function init() {  
+        // 注册自定义权限项  
+        add_filter('user_has_cap', [__CLASS__, 'grant_custom_caps'], 10, 4);  
+
+        // 子站管理员权限校验  
+        add_action('admin_init', [__CLASS__, 'check_admin_access']);  
+    }  
+
+    /**  
+     * 动态授予子站管理员权限  
+     */  
+    public static function grant_custom_caps($allcaps, $caps, $args, $user) {  
+        if (is_multisite() && !is_super_admin($user->ID)) {  
+            // 子站管理员默认拥有支付管理权限  
+            $allcaps[self::CAP_MANAGE_PAYMENT] = true;  
+            $allcaps[self::CAP_VIEW_AUDIT_LOG] = true;  
+        }  
+        return $allcaps;  
+    }  
+
+    /**  
+     * 校验用户是否具备操作权限  
+     * @param string $capability 权限标识  
+     * @throws Exception 权限不足时抛出异常  
+     */  
+    public static function validate_capability($capability) {  
+        if (!current_user_can($capability)) {  
+            Tao_AuditLog::log('permission_denied', get_current_user_id(), [  
+                'attempted_cap' => $capability,  
+                'ip' => $_SERVER['REMOTE_ADDR']  
+            ]);  
+            throw new Exception("权限不足: 缺少 {$capability} 权限");  
+        }  
+    }  
+
+    /**  
+     * 阻止子站管理员访问网络级配置  
+     */  
+    public static function check_admin_access() {  
+        if (is_network_admin() && !is_super_admin()) {  
+            wp_die('无权访问网络级配置');  
+        }  
+    }  
+
+    /**  
+     * 分配自定义角色权限（插件激活时调用）  
+     */  
+    public static function assign_roles() {  
+        $role = get_role('shop_manager');  
+        if ($role) {  
+            $role->add_cap(self::CAP_MANAGE_PAYMENT);  
+            $role->add_cap(self::CAP_VIEW_AUDIT_LOG);  
+        }  
+    }  
+}  
+
+// 初始化权限模块  
+Tao_Permissions::init();  -e 
+
+
+==== ./includes/security/class-login-monitor.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_LoginMonitor {  
+    const FAILED_LOGIN_LIMIT = 5;  
+    const BLOCK_TIME = 3600; // 1小时  
+
+    /**  
+     * 记录登录失败尝试  
+     */  
+    public static function track_failed_login($username) {  
+        $ip = $_SERVER['REMOTE_ADDR'];  
+        $transient_key = 'tao_failed_login_' . $ip;  
+
+        // 获取当前失败次数  
+        $attempts = get_transient($transient_key) ?: 0;  
+        $attempts++;  
+
+        // 触发封锁逻辑  
+        if ($attempts >= self::FAILED_LOGIN_LIMIT) {  
+            self::block_ip($ip);  
+            Tao_AuditLog::log('ip_blocked', null, [  
+                'ip' => $ip,  
+                'reason' => '登录失败次数超限'  
+            ]);  
+        }  
+
+        set_transient($transient_key, $attempts, self::BLOCK_TIME);  
+    }  
+
+    /**  
+     * IP封锁逻辑（集成Fail2Ban）  
+     */  
+    private static function block_ip($ip) {  
+        // 更新Fail2Ban规则  
+        $ban_file = '/etc/fail2ban/jail.d/tao-payment.conf';  
+        if (file_exists($ban_file)) {  
+            $rule = "deny $ip;\n";  
+            file_put_contents($ban_file, $rule, FILE_APPEND);  
+        }  
+
+        // 写入WordPress黑名单  
+        update_option('tao_blocked_ips', array_unique(array_merge(  
+            (array)get_option('tao_blocked_ips', []),  
+            [$ip]  
+        )));  
+    }  
+
+    /**  
+     * 校验当前IP是否被封禁  
+     */  
+    public static function is_ip_blocked($ip = null) {  
+        $ip = $ip ?: $_SERVER['REMOTE_ADDR'];  
+        return in_array($ip, (array)get_option('tao_blocked_ips', []));  
+    }  
+}  
+
+// 挂载到WordPress登录失败钩子  
+add_action('wp_login_failed', ['Tao_LoginMonitor', 'track_failed_login']);  -e 
+
+
+==== ./includes/security/class-coldstorage.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_ColdStorage {  
+    const STORAGE_DIR = WP_CONTENT_DIR . '/tao-cold-storage/';  
+    const ENCRYPT_PREFIX = 'ENC_';  
+
+    /**  
+     * 归档历史密钥到加密文件  
+     * @param string $data 需归档的敏感数据  
+     */  
+    public static function archive($data) {  
+        if (!is_dir(self::STORAGE_DIR)) {  
+            wp_mkdir_p(self::STORAGE_DIR);  
+        }  
+
+        $filename = self::ENCRYPT_PREFIX . date('Ymd-His') . '.dat';  
+        $filepath = self::STORAGE_DIR . $filename;  
+
+        // 使用当前激活密钥加密数据  
+        $encrypted = openssl_encrypt(  
+            $data,  
+            'AES-256-GCM',  
+            Tao_KeyRotator::get_current_key(),  
+            0,  
+            $iv = random_bytes(16),  
+            $tag  
+        );  
+
+        // 存储加密内容（IV+Tag+密文）  
+        file_put_contents(  
+            $filepath,  
+            base64_encode($iv . $tag . $encrypted)  
+        );  
+
+        // 设置文件权限  
+        chmod($filepath, 0600);  
+
+        Tao_AuditLog::log('coldstorage_archived', null, [  
+            'filename' => $filename,  
+            'data_type' => 'legacy_key'  
+        ]);  
+    }  
+
+    /**  
+     * 从冷存储恢复数据  
+     * @param string $filename 加密文件名  
+     * @return string 解密后的明文  
+     */  
+    public static function restore($filename) {  
+        $filepath = self::STORAGE_DIR . $filename;  
+        if (!file_exists($filepath)) {  
+            throw new RuntimeException("冷存储文件不存在: $filename");  
+        }  
+
+        $raw = base64_decode(file_get_contents($filepath));  
+        $iv = substr($raw, 0, 16);  
+        $tag = substr($raw, 16, 16);  
+        $ciphertext = substr($raw, 32);  
+
+        return openssl_decrypt(  
+            $ciphertext,  
+            'AES-256-GCM',  
+            Tao_KeyRotator::get_current_key(),  
+            0,  
+            $iv,  
+            $tag  
+        );  
+    }  
+
+    /**  
+     * 清理过期归档文件（超过365天）  
+     */  
+    public static function cleanup_expired() {  
+        foreach (glob(self::STORAGE_DIR . self::ENCRYPT_PREFIX . '*.dat') as $file) {  
+            if (time() - filemtime($file) > 31536000) { // 365天  
+                unlink($file);  
+                Tao_AuditLog::log('coldstorage_cleaned', null, ['filename' => basename($file)]);  
+            }  
+        }  
+    }  
+}  
+
+// 注册每日清理任务  
+add_action('tao_daily_cron', ['Tao_ColdStorage', 'cleanup_expired']);  -e 
+
+
+==== ./includes/security/class-keyrotator.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_KeyRotator {  
+    const ENCRYPT_METHOD = 'AES-256-GCM';  
+    const ROTATION_DAYS = 90;  
+
+    /**  
+     * 加密数据（优先使用HSM）  
+     */  
+    public static function encrypt($data) {  
+        if (self::use_hsm()) {  
+            return HSM_Client::encrypt($data);  
+        }  
+        return self::software_encrypt($data);  
+    }  
+
+    /**  
+     * 解密数据（自动检测HSM加密）  
+     */  
+    public static function decrypt($ciphertext) {  
+        if (self::is_hsm_ciphertext($ciphertext)) {  
+            return HSM_Client::decrypt($ciphertext);  
+        }  
+        return self::software_decrypt($ciphertext);  
+    }  
+
+    /**  
+     * 密钥轮换定时任务  
+     */  
+    public static function rotate_keys() {  
+        $current_key = get_option('tao_current_key');  
+        $legacy_key = get_option('tao_legacy_key');  
+
+        // 归档旧密钥  
+        if ($legacy_key) {  
+            Tao_ColdStorage::archive($legacy_key);  
+        }  
+
+        // 生成新密钥  
+        $new_key = bin2hex(random_bytes(32));  
+        update_option('tao_legacy_key', $current_key);  
+        update_option('tao_current_key', $new_key);  
+
+        Tao_AuditLog::log('key_rotated', null, [  
+            'rotation_time' => current_time('mysql')  
+        ]);  
+    }  
+
+    /**  
+     * 软件加密实现（AES-256-GCM）  
+     */  
+    private static function software_encrypt($data) {  
+        $key = self::get_current_key();  
+        $iv = random_bytes(openssl_cipher_iv_length(self::ENCRYPT_METHOD));  
+        $tag = '';  
+        $ciphertext = openssl_encrypt($data, self::ENCRYPT_METHOD, $key, 0, $iv, $tag);  
+        return base64_encode($iv . $tag . $ciphertext);  
+    }  
+
+    /**  
+     * 判断是否为HSM加密数据  
+     */  
+    private static function is_hsm_ciphertext($str) {  
+        return strpos($str, 'HSM_') === 0;  
+    }  
+
+    /**  
+     * 是否启用HSM  
+     */  
+    private static function use_hsm() {  
+        return defined('TAO_USE_HSM') && TAO_USE_HSM;  
+    }  
+}  
+
+// 注册每日密钥轮换检查  
+add_action('tao_daily_cron', ['Tao_KeyRotator', 'rotate_keys']);  -e 
+
+
+==== ./includes/payment/alipay/class-alipay-sdk.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Alipay {  
+    const API_GATEWAY = 'https://openapi.alipay.com/gateway.do';  
+    private $app_id;  
+    private $private_key;  
+    private $public_key;  
+
+    public function __construct($config) {  
+        $this->app_id      = $config['app_id'];  
+        $this->private_key = $config['private_key'];  
+        $this->public_key  = $config['public_key'];  
+    }  
+
+    /**  
+     * 生成电脑网站支付链接  
+     * @param array $order_data 订单数据（必须包含out_trade_no、total_amount）  
+     * @return string 支付跳转URL  
+     */  
+    public function page_pay($order_data) {  
+        $params = [  
+            'app_id'      => $this->app_id,  
+            'method'      => 'alipay.trade.page.pay',  
+            'charset'     => 'UTF-8',  
+            'sign_type'   => 'RSA2',  
+            'timestamp'   => date('Y-m-d H:i:s'),  
+            'version'     => '1.0',  
+            'biz_content' => json_encode(array_merge(  
+                ['product_code' => 'FAST_INSTANT_TRADE_PAY'],  
+                $order_data  
+            ))  
+        ];  
+
+        // 生成签名并构造请求URL  
+        $params['sign'] = $this->generate_signature($params);  
+        return self::API_GATEWAY . '?' . http_build_query($params);  
+    }  
+
+    /**  
+     * 支付宝回调验签  
+     * @param array $data 回调参数  
+     * @return bool  
+     */  
+    public function verify_callback($data) {  
+        $sign = $data['sign'];  
+        unset($data['sign'], $data['sign_type']);  
+        ksort($data);  
+
+        $str = urldecode(http_build_query($data));  
+        return openssl_verify(  
+            $str,  
+            base64_decode($sign),  
+            $this->public_key,  
+            OPENSSL_ALGO_SHA256  
+        ) === 1;  
+    }  
+
+    /**  
+     * 生成RSA2签名  
+     */  
+    private function generate_signature($params) {  
+        ksort($params);  
+        $str = urldecode(http_build_query($params));  
+        openssl_sign($str, $sign, $this->private_key, OPENSSL_ALGO_SHA256);  
+        return base64_encode($sign);  
+    }  
+}  -e 
+
+
+==== ./includes/payment/wechat/class-wechat-sdk.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_WeChatPay {  
+    const API_BASE_URL = 'https://api.mch.weixin.qq.com/v3';  
+    private $mch_id;  
+    private $api_key;  
+    private $cert_path;  
+
+    public function __construct($mch_id, $api_key, $cert_path = '') {  
+        $this->mch_id = $mch_id;  
+        $this->api_key = $api_key;  
+        $this->cert_path = $cert_path ?: get_option('tao_wechat_cert_path');  
+
+        if (!file_exists($this->cert_path)) {  
+            throw new RuntimeException("微信支付证书文件不存在: " . $this->cert_path);  
+        }  
+    }  
+
+    /**  
+     * 创建Native支付订单  
+     * @param float $amount 金额（单位：元）  
+     * @param string $out_trade_no 商户订单号  
+     * @return string 支付二维码链接  
+     */  
+    public function create_order($amount, $out_trade_no) {  
+        $url = self::API_BASE_URL . '/pay/transactions/native';  
+        $data = [  
+            'mchid' => $this->mch_id,  
+            'out_trade_no' => $out_trade_no,  
+            'amount' => [  
+                'total' => intval($amount * 100),  
+                'currency' => 'CNY'  
+            ],  
+            'notify_url' => Tao_Core_Settings::get_payment_domain() . '/wp-json/tao-payment/v1/callback/wechat'  
+        ];  
+
+        $response = $this->signed_request('POST', $url, $data);  
+        return $response['code_url'] ?? '';  
+    }  
+
+    /**  
+     * 带证书和签名的HTTP请求  
+     */  
+    private function signed_request($method, $url, $data) {  
+        $timestamp = time();  
+        $nonce = md5(uniqid());  
+        $body = json_encode($data);  
+        $message = "$method\n$url\n$timestamp\n$nonce\n$body";  
+
+        // 生成HMAC-SHA256签名  
+        $signature = hash_hmac('sha256', $message, $this->api_key);  
+
+        $headers = [  
+            'Content-Type: application/json',  
+            'Authorization: WECHATPAY2-SHA256-RSA2048 ' . implode(',', [  
+                'mchid="' . $this->mch_id . '"',  
+                'nonce_str="' . $nonce . '"',  
+                'timestamp="' . $timestamp . '"',  
+                'serial_no="' . $this->get_cert_serial() . '"',  
+                'signature="' . $signature . '"'  
+            ])  
+        ];  
+
+        $ch = curl_init();  
+        curl_setopt_array($ch, [  
+            CURLOPT_URL => $url,  
+            CURLOPT_HTTPHEADER => $headers,  
+            CURLOPT_SSLCERT => $this->cert_path,  
+            CURLOPT_SSLKEY => $this->cert_path,  
+            CURLOPT_POST => $method === 'POST',  
+            CURLOPT_POSTFIELDS => $body,  
+            CURLOPT_RETURNTRANSFER => true  
+        ]);  
+
+        $result = curl_exec($ch);  
+        if (curl_errno($ch)) {  
+            Tao_AuditLog::log('wechat_request_error', null, [  
+                'error' => curl_error($ch),  
+                'url' => $url  
+            ]);  
+            throw new RuntimeException("微信支付接口请求失败");  
+        }  
+
+        return json_decode($result, true);  
+    }  
+
+    /**  
+     * 从证书提取序列号  
+     */  
+    private function get_cert_serial() {  
+        $cert = openssl_x509_parse(file_get_contents($this->cert_path));  
+        return $cert['serialNumberHex'] ?? '';  
+    }  
+}  -e 
+
+
+==== ./includes/payment/wechat/hsm/class-hsm-client.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class HSM_Client {  
+    const HSM_KEY_ARN = 'arn:aws:kms:us-west-2:123456789012:key/your-key-id'; // AWS KMS密钥ARN  
+
+    /**  
+     * 使用HSM加密数据  
+     * @param string $plaintext 明文数据  
+     * @return string Base64编码的密文  
+     * @throws Exception 加密失败时抛出异常  
+     */  
+    public static function encrypt($plaintext) {  
+        try {  
+            $kms = new Aws\Kms\KmsClient([  
+                'version' => 'latest',  
+                'region'  => 'us-west-2'  
+            ]);  
+
+            $result = $kms->encrypt([  
+                'KeyId'     => self::HSM_KEY_ARN,  
+                'Plaintext' => $plaintext,  
+                'EncryptionAlgorithm' => 'SYMMETRIC_DEFAULT'  
+            ]);  
+
+            return base64_encode($result['CiphertextBlob']);  
+        } catch (Aws\Exception\AwsException $e) {  
+            Tao_AuditLog::log('hsm_error', null, [  
+                'operation' => 'encrypt',  
+                'error' => $e->getAwsErrorMessage()  
+            ]);  
+            throw new RuntimeException("HSM加密失败: " . $e->getMessage());  
+        }  
+    }  
+
+    /**  
+     * 使用HSM解密数据  
+     * @param string $ciphertext Base64编码的密文  
+     * @return string 解密后的明文  
+     * @throws Exception 解密失败时抛出异常  
+     */  
+    public static function decrypt($ciphertext) {  
+        try {  
+            $kms = new Aws\Kms\KmsClient([  
+                'version' => 'latest',  
+                'region'  => 'us-west-2'  
+            ]);  
+
+            $result = $kms->decrypt([  
+                'CiphertextBlob' => base64_decode($ciphertext),  
+                'KeyId' => self::HSM_KEY_ARN,  
+                'EncryptionAlgorithm' => 'SYMMETRIC_DEFAULT'  
+            ]);  
+
+            return $result['Plaintext'];  
+        } catch (Aws\Exception\AwsException $e) {  
+            Tao_AuditLog::log('hsm_error', null, [  
+                'operation' => 'decrypt',  
+                'error' => $e->getAwsErrorMessage()  
+            ]);  
+            throw new RuntimeException("HSM解密失败: " . $e->getMessage());  
+        }  
+    }  
+
+    /**  
+     * 生成数据密钥（用于本地加密）  
+     * @return array ['CiphertextBlob' => 加密的密钥, 'Plaintext' => 明文密钥]  
+     */  
+    public static function generate_data_key() {  
+        try {  
+            $kms = new Aws\Kms\KmsClient([  
+                'version' => 'latest',  
+                'region'  => 'us-west-2'  
+            ]);  
+
+            $result = $kms->generateDataKey([  
+                'KeyId' => self::HSM_KEY_ARN,  
+                'KeySpec' => 'AES_256'  
+            ]);  
+
+            return [  
+                'ciphertext' => base64_encode($result['CiphertextBlob']),  
+                'plaintext'  => base64_encode($result['Plaintext'])  
+            ];  
+        } catch (Aws\Exception\AwsException $e) {  
+            throw new RuntimeException("HSM生成数据密钥失败: " . $e->getMessage());  
+        }  
+    }  
+}  
+
+// 自动加载AWS SDK（需确保vendor依赖已安装）  
+if (!class_exists('Aws\Kms\KmsClient')) {  
+    require_once plugin_dir_path(__FILE__) . '../../../vendor/autoload.php';  
+}-e 
+
+
+==== ./includes/payment/class-callback-handler.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Callback_Handler {  
+    const MAX_RETRIES = 3;  
+    const RETRY_INTERVAL = 10; // 秒  
+
+    /**  
+     * 微信支付回调处理（含签名校验）  
+     */  
+    public static function handle_wechat_callback(WP_REST_Request $request) {  
+        try {  
+            // 获取原始数据并验证签名  
+            $raw_data = $request->get_body();  
+            $headers = $request->get_headers();  
+            $signature = $headers['wechatpay-signature'] ?? '';  
+
+            if (!self::verify_wechat_signature($raw_data, $signature)) {  
+                throw new Exception("HMAC-SHA256签名校验失败");  
+            }  
+
+            // 解析订单数据  
+            $data = json_decode($raw_data, true);  
+            $order_id = $data['out_trade_no'] ?? '';  
+            $status = $data['trade_state'] ?? '';  
+
+            // 处理支付结果  
+            if ($status === 'SUCCESS') {  
+                self::mark_order_paid($order_id);  
+                Tao_AuditLog::log('payment_success', null, [  
+                    'order_id' => $order_id,  
+                    'amount' => $data['amount']['total'] / 100  
+                ]);  
+                return new WP_REST_Response(['code' => 'SUCCESS'], 200);  
+            }  
+
+            // 失败时触发重试机制  
+            $retry_count = get_post_meta($order_id, '_retry_count', true) ?: 0;  
+            if ($retry_count < self::MAX_RETRIES) {  
+                wp_schedule_single_event(time() + self::RETRY_INTERVAL, 'tao_retry_callback', [$order_id]);  
+                update_post_meta($order_id, '_retry_count', $retry_count + 1);  
+            }  
+
+            return new WP_REST_Response(['code' => 'FAIL'], 400);  
+
+        } catch (Exception $e) {  
+            Tao_AuditLog::log('callback_error', null, [  
+                'error' => $e->getMessage(),  
+                'raw_data' => $raw_data  
+            ]);  
+            return new WP_REST_Response(['code' => 'SYSTEMERROR'], 500);  
+        }  
+    }  
+
+    /**  
+     * HMAC-SHA256签名校验  
+     */  
+    private static function verify_wechat_signature($data, $signature) {  
+        $api_key = Tao_KeyRotator::decrypt(get_option('tao_wechat_api_key'));  
+        $calculated_sign = hash_hmac('sha256', $data, $api_key);  
+        return hash_equals($calculated_sign, $signature);  
+    }  
+
+    /**  
+     * 标记订单为已支付  
+     */  
+    private static function mark_order_paid($order_id) {  
+        update_post_meta($order_id, '_payment_status', 'paid');  
+        do_action('tao_payment_completed', $order_id);  
+    }  
+
+    /**  
+     * 支付宝回调处理  
+     */  
+    public static function handle_alipay_callback(WP_REST_Request $request) {  
+        // 实现逻辑类似微信支付  
+    }  
+}  -e 
+
+
+==== ./includes/admin/class-admin-scripts.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Admin_Scripts {  
+    /**
+     * 注册前端脚本与翻译资源
+     */
+    public static function enqueue_scripts() {  
+        // 注册核心脚本  
+        wp_register_script(  
+            'tao-payment-admin',  
+            plugins_url('assets/js/admin.js', dirname(__FILE__)),  
+            ['jquery'],  
+            '1.0.0',  
+            true  
+        );  
+
+        // 注入当前语言环境与翻译字典  
+        $locale = get_locale();  
+        $translations = self::get_frontend_translations($locale);  
+        wp_localize_script('tao-payment-admin', 'tao_i18n', [  
+            'locale' => $locale,  
+            'strings' => $translations  
+        ]);  
+
+        // 加载脚本  
+        wp_enqueue_script('tao-payment-admin');  
+    }  
+
+    /**
+     * 获取前端翻译字典（从PO文件动态加载）
+     */
+    private static function get_frontend_translations($locale) {  
+        $translations = [];  
+        $po_file = WP_LANG_DIR . "/plugins/tao-payment-{$locale}.po";  
+
+        if (file_exists($po_file)) {  
+            $po_contents = file_get_contents($po_file);  
+            preg_match_all('/msgid "(.+)"\nmsgstr "(.+)"/', $po_contents, $matches);  
+            foreach ($matches as $index => $msgid) {  
+                $translations[$msgid] = $matches[$index];  
+            }  
+        }  
+
+        return $translations;  
+    }  
+}  
+
+// 挂载到管理后台脚本加载钩子  
+add_action('admin_enqueue_scripts', ['Tao_Admin_Scripts', 'enqueue_scripts']);  -e 
+
+
+==== ./includes/admin/class-setup-wizard.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Setup_Wizard {  
+    /**  
+     * 初始化配置向导  
+     */  
+    public static function init() {  
+        add_action('admin_menu', [__CLASS__, 'add_wizard_page']);  
+    }  
+
+    /**  
+     * 添加向导页面  
+     */  
+    public static function add_wizard_page() {  
+        add_dashboard_page(  
+            __('支付配置向导', 'tao-payment'),  
+            __('支付配置向导', 'tao-payment'),  
+            'manage_options',  
+            'tao-payment-wizard',  
+            [__CLASS__, 'render_wizard']  
+        );  
+    }  
+
+    /**  
+     * 渲染向导界面  
+     */  
+    public static function render_wizard() {  
+        // 分步表单实现（HTML模板略）  
+    }  
+}  
+Tao_Setup_Wizard::init();  -e 
+
+
+==== ./includes/admin/views/audit-logs.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+// 审计日志界面模板  
+?>  
+<div class="wrap tao-audit-logs">  
+    <h1><?php esc_html_e('审计日志', 'tao-payment'); ?></h1>  
+    
+    <div class="filter-section">  
+        <input type="date" id="start-date" name="start_date">  
+        <input type="date" id="end-date" name="end_date">  
+        <select id="log-type">  
+            <option value="all"><?php esc_html_e('全部类型', 'tao-payment'); ?></option>  
+            <option value="payment_success"><?php esc_html_e('支付成功', 'tao-payment'); ?></option>  
+            <option value="payment_error"><?php esc_html_e('支付失败', 'tao-payment'); ?></option>  
+        </select>  
+        <button id="filter-logs" class="button"><?php esc_html_e('筛选', 'tao-payment'); ?></button>  
+    </div>  
+
+    <table class="wp-list-table widefat fixed striped">  
+        <thead>  
+            <tr>  
+                <th><?php esc_html_e('时间', 'tao-payment'); ?></th>  
+                <th><?php esc_html_e('操作类型', 'tao-payment'); ?></th>  
+                <th><?php esc_html_e('用户', 'tao-payment'); ?></th>  
+                <th><?php esc_html_e('IP地址', 'tao-payment'); ?></th>  
+                <th><?php esc_html_e('详情', 'tao-payment'); ?></th>  
+            </tr>  
+        </thead>  
+        <tbody id="audit-log-entries"></tbody>  
+    </table>  
+</div>  -e 
+
+
+==== ./includes/admin/views/setup-wizard.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Setup_Wizard {  
+    public static function render() {  
+        ?>  
+        <div class="wrap tao-wizard">  
+            <h1><?php _e('支付配置向导', 'tao-payment'); ?></h1>  
+            <div class="progress-bar">  
+                <div class="step active" data-step="1">基础配置</div>  
+                <div class="step" data-step="2">微信支付</div>  
+                <div class="step" data-step="3">支付宝</div>  
+            </div>  
+
+            <form id="tao-setup-form">  
+                <!-- 步骤1 -->  
+                <div class="step-content" data-step="1">  
+                    <label>支付域名：  
+                        <input type="url" name="payment_domain" required pattern="^https://.*">  
+                    </label>  
+                </div>  
+
+                <!-- 步骤2 -->  
+                <div class="step-content" data-step="2">  
+                    <label>微信商户号：  
+                        <input type="text" name="wechat_mch_id" required>  
+                    </label>  
+                </div>  
+
+                <!-- 步骤3 -->  
+                <div class="step-content" data-step="3">  
+                    <label>支付宝应用ID：  
+                        <input type="text" name="alipay_app_id" required>  
+                    </label>  
+                </div>  
+            </form>  
+        </div>  
+        <?php  
+    }  
+}  -e 
+
+
+==== ./includes/logs/class-auditlog.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_AuditLog {  
+    const LOG_TABLE = 'tao_audit_logs';  
+
+    /**  
+     * 记录审计日志（自动脱敏）  
+     */  
+    public static function log($action_type, $user_id = null, $details = []) {  
+        global $wpdb;  
+
+        // 敏感字段过滤  
+        $details = self::sanitize_details($details);  
+
+        $wpdb->insert(self::LOG_TABLE, [  
+            'user_id' => $user_id ?? get_current_user_id(),  
+            'action_type' => $action_type,  
+            'ip' => self::mask_ip($_SERVER['REMOTE_ADDR']),  
+            'details' => json_encode($details),  
+            'timestamp' => current_time('mysql')  
+        ]);  
+    }  
+
+    /**  
+     * IP地址脱敏处理  
+     */  
+    private static function mask_ip($ip) {  
+        return preg_replace('/\.(\d+)$/', '.x', $ip);  
+    }  
+
+    /**  
+     * 敏感字段过滤规则  
+     */  
+    private static function sanitize_details($details) {  
+        $sensitive_keys = ['api_key', 'private_key', 'password'];  
+        foreach ($sensitive_keys as $key) {  
+            if (isset($details[$key])) {  
+                $details[$key] = '******';  
+            }  
+        }  
+        return $details;  
+    }  
+
+    /**  
+     * 查询日志（权限校验）  
+     */  
+    public static function query_logs($args) {  
+        Tao_Permissions::validate_capability(Tao_Permissions::CAP_VIEW_AUDIT_LOG);  
+
+        global $wpdb;  
+        return $wpdb->get_results($wpdb->prepare("  
+            SELECT * FROM {$wpdb->prefix}tao_audit_logs  
+            WHERE timestamp >= %s AND timestamp <= %s  
+            ORDER BY id DESC  
+            LIMIT %d  
+        ", $args['start'], $args['end'], $args['limit']));  
+    }  
+}  -e 
+
+
+==== ./includes/logs/class-logexporter.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_LogExporter {  
+
+    /**  
+     * 导出CSV文件  
+     */  
+    public static function export_csv($logs) {  
+        header('Content-Type: text/csv');  
+        header('Content-Disposition: attachment; filename="audit_logs.csv"');  
+
+        $fp = fopen('php://output', 'w');  
+        fputcsv($fp, ['时间', '操作类型', '用户ID', 'IP地址', '详情']);  
+
+        foreach ($logs as $log) {  
+            fputcsv($fp, [  
+                $log->timestamp,  
+                $log->action_type,  
+                $log->user_id,  
+                $log->ip,  
+                json_decode($log->details)  
+            ]);  
+        }  
+        fclose($fp);  
+        exit;  
+    }  
+
+    /**  
+     * 生成PDF报告  
+     */  
+    public static function generate_pdf($logs) {  
+        require_once plugin_dir_path(__FILE__) . '../../vendor/autoload.php';  
+
+        $mpdf = new \Mpdf\Mpdf();  
+        $html = '<h1>审计日志报告</h1>';  
+        $html .= '<table border="1">  
+            <tr><th>时间</th><th>操作类型</th><th>用户</th><th>IP</th><th>详情</th></tr>';  
+
+        foreach ($logs as $log) {  
+            $html .= sprintf('<tr>  
+                <td>%s</td>  
+                <td>%s</td>  
+                <td>%d</td>  
+                <td>%s</td>  
+                <td>%s</td>  
+            </tr>',  
+                $log->timestamp,  
+                $log->action_type,  
+                $log->user_id,  
+                $log->ip,  
+                json_encode(json_decode($log->details), JSON_PRETTY_PRINT)  
+            );  
+        }  
+        $html .= '</table>';  
+
+        $mpdf->WriteHTML($html);  
+        $mpdf->Output('audit_logs.pdf', 'D');  
+        exit;  
+    }  
+}  -e 
+
+
+==== ./includes/monitoring/class-prometheus.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_Prometheus {  
+    const PUSH_GATEWAY = 'http://prometheus:9091/metrics/job/tao_payment';  
+
+    /**  
+     * 上报支付成功率指标  
+     */  
+    public static function push_success_rate($rate) {  
+        $metrics = "# HELP tao_payment_success_rate 支付成功率\n";  
+        $metrics .= "# TYPE tao_payment_success_rate gauge\n";  
+        $metrics .= "tao_payment_success_rate $rate\n";  
+
+        wp_remote_post(self::PUSH_GATEWAY, [  
+            'body' => $metrics,  
+            'headers' => ['Content-Type' => 'text/plain']  
+        ]);  
+    }  
+
+    /**  
+     * 上报自定义指标  
+     */  
+    public static function push_metric($name, $value, $labels = []) {  
+        $label_str = '';  
+        foreach ($labels as $k => $v) {  
+            $label_str .= "$k=\"$v\",";  
+        }  
+        $label_str = rtrim($label_str, ',');  
+
+        $metrics = "# HELP tao_$name Custom metric\n";  
+        $metrics .= "# TYPE tao_$name gauge\n";  
+        $metrics .= "tao_$name{$label_str} $value\n";  
+
+        wp_remote_post(self::PUSH_GATEWAY, [  
+            'body' => $metrics,  
+            'headers' => ['Content-Type' => 'text/plain']  
+        ]);  
+    }  
+}  -e 
+
+
+==== ./includes/monitoring/class-healthcheck.php ====
+<?php  
+if (!defined('ABSPATH')) exit;  
+
+class Tao_HealthCheck {  
+    const CERT_EXPIRE_THRESHOLD = 7 * 86400; // 7天  
+
+    /**  
+     * 扫描支付证书有效期  
+     */  
+    public static function check_cert_expiry() {  
+        $alerts = [];  
+
+        // 检查微信证书  
+        $wechat_cert = get_option('tao_wechat_cert_path');  
+        if ($wechat_cert && file_exists($wechat_cert)) {  
+            $expiry = self::get_pem_expiry($wechat_cert);  
+            if ($expiry - time() < self::CERT_EXPIRE_THRESHOLD) {  
+                $alerts[] = "微信证书将在" . date('Y-m-d', $expiry) . "过期";  
+            }  
+        }  
+
+        // 检查支付宝证书  
+        $alipay_cert = get_option('tao_alipay_cert_path');  
+        if ($alipay_cert && file_exists($alipay_cert)) {  
+            $expiry = self::get_pem_expiry($alipay_cert);  
+            if ($expiry - time() < self::CERT_EXPIRE_THRESHOLD) {  
+                $alerts[] = "支付宝证书将在" . date('Y-m-d', $expiry) . "过期";  
+            }  
+        }  
+
+        // 触发报警  
+        if (!empty($alerts)) {  
+            self::send_alert(implode("\n", $alerts));  
+        }  
+    }  
+
+    /**  
+     * 计算支付延迟P99  
+     */  
+    public static function calculate_p99_latency() {  
+        global $wpdb;  
+        $results = $wpdb->get_results("  
+            SELECT request_time FROM {$wpdb->prefix}tao_payment_logs  
+            WHERE created_at > NOW() - INTERVAL 1 HOUR  
+            ORDER BY request_time DESC  
+            LIMIT 1000  
+        ");  
+
+        $latencies = array_column($results, 'request_time');  
+        $p99 = round(percentile($latencies, 0.99), 2);  
+
+        // 上报Prometheus  
+        Tao_Prometheus::push_metric('payment_latency_p99', $p99);  
+        return $p99;  
+    }  
+
+    /**  
+     * 获取PEM证书过期时间  
+     */  
+    private static function get_pem_expiry($path) {  
+        $cert = openssl_x509_parse(file_get_contents($path));  
+        return $cert['validTo_time_t'] ?? 0;  
+    }  
+}  
+
+// 注册定时任务  
+add_action('tao_hourly_cron', ['Tao_HealthCheck', 'check_cert_expiry']);  
+add_action('tao_hourly_cron', ['Tao_HealthCheck', 'calculate_p99_latency']);  -e 
+
+
+==== ./assets/css/admin.css ====
+/* 后台管理界面样式 */  
+.tao-wizard {  
+    max-width: 800px;  
+    margin: 20px auto;  
+    padding: 20px;  
+    background: #fff;  
+    border-radius: 4px;  
+}  
+
+.wizard-steps {  
+    display: flex;  
+    margin-bottom: 30px;  
+}  
+.wizard-steps .step {  
+    flex: 1;  
+    text-align: center;  
+    padding: 10px;  
+    border-bottom: 2px solid #ddd;  
+    color: #666;  
+}  
+.wizard-steps .step.active {  
+    border-color: #0073aa;  
+    color: #0073aa;  
+}  
+
+.step-content.hidden {  
+    display: none;  
+}  
+
+.tao-audit-logs .filter-section {  
+    margin-bottom: 20px;  
+}  
+.tao-audit-logs input, .tao-audit-logs select {  
+    margin-right: 10px;  
+}  
+
+.validation-error {  
+    color: #dc3232;  
+    font-size: 0.9em;  
+    margin-top: 5px;  
+}  -e 
+
+
+==== ./assets/js/tao-i18n.js ====
+/**
+ * 前端国际化模块（动态加载翻译资源）
+ * @version 1.0.0
+ */
+const TaoI18n = (function() {
+    let translations = {};
+  
+    // 初始化翻译字典（通过WordPress注入）
+    function init(locale = 'en_US') {
+      const i18nData = window.tao_i18n || {};
+      translations = i18nData[locale] || i18nData['en_US'] || {};
+    }
+  
+    /**
+     * 获取翻译字符串（支持动态参数）
+     * @param {string} key - 翻译键名
+     * @param {...any} args - 动态参数（可选）
+     * @returns {string} 翻译后的字符串
+     */
+    function t(key, ...args) {
+      let text = translations[key] || key;
+      args.forEach((arg, index) => {
+        text = text.replace(new RegExp(`\\{${index}\\}`, 'g'), arg);
+      });
+      return text;
+    }
+  
+    return { init, t };
+  })();
+  
+  // 默认根据WordPress语言环境初始化
+  document.addEventListener('DOMContentLoaded', () => {
+    TaoI18n.init(window.tao_locale || 'en_US');
+  });-e 
+
+
+==== ./assets/js/admin-validation.js ====
+document.addEventListener('DOMContentLoaded', function() {  
+    // 支付域名校验  
+    const domainInput = document.querySelector('input[name="payment_domain"]');  
+    if (domainInput) {  
+        domainInput.addEventListener('blur', function(e) {  
+            const isValid = /^https:\/\/[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}$/.test(e.target.value);  
+            showValidationMessage(e.target, isValid, '域名必须为有效的HTTPS地址');  
+        });  
+    }  
+
+    // 支付宝私钥校验  
+    document.querySelectorAll('textarea[name="alipay_private_key"]').forEach(input => {  
+        input.addEventListener('input', function(e) {  
+            const key = e.target.value.trim();  
+            const isValid = key.startsWith('-----BEGIN RSA PRIVATE KEY-----') &&  
+                            key.endsWith('-----END RSA PRIVATE KEY-----');  
+            showValidationMessage(e.target, isValid, '必须为RSA私钥PEM格式');  
+        });  
+    });  
+
+    // 微信证书上传校验  
+    const wechatCertInput = document.querySelector('input[name="wechat_cert"]');  
+    if (wechatCertInput) {  
+        wechatCertInput.addEventListener('change', function(e) {  
+            const file = e.target.files;  
+            const isValid = file?.name.endsWith('.pem');  
+            showValidationMessage(e.target, isValid, '必须选择.pem格式的证书文件');  
+        });  
+    }  
+
+    function showValidationMessage(element, isValid, errorMsg) {  
+        const errorSpan = element.parentElement.querySelector('.validation-error');  
+        if (!errorSpan) {  
+            const span = document.createElement('span');  
+            span.className = 'validation-error tao-error';  
+            element.parentElement.appendChild(span);  
+        }  
+        element.parentElement.querySelector('.validation-error').textContent = isValid ? '' : errorMsg;  
+    }  
+});  -e 
+
+
