@@ -152,7 +152,7 @@ document.querySelector('input[name="payment_domain"]').addEventListener('blur', 
 
 ##### **5.2.1.2 PC端支付**
 动态二维码生成（含RSA加密）
-支付状态WebSocket推送
+
 
 
 ---
