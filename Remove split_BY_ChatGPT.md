@@ -468,7 +468,7 @@ Webhook 失败后，如果不进行重试，可能导致支付/退款状态更�
 - Webhook 失败后，自动加入队列，最多重试 3 次。
 - 如果重试 3 次仍失败，管理员可以手动重试。
 
-#### 代码实现
+#### **✅ 代码实现**
 ```php
 function store_failed_webhook($endpoint, $request_data) {
     global $wpdb;
@@ -509,7 +509,7 @@ function retry_failed_webhooks() {
 add_action('woocommerce_cleanup_sessions', 'retry_failed_webhooks');
 ```
 
-## 优点
+#### 优点
 - ✅ Webhook 失败最多重试 3 次，防止无限重试
 - ✅ 失败超过 24 小时的 Webhook 记录会自动清理，防止数据库积累过多失败数据
 
@@ -523,7 +523,7 @@ Webhook 失败 3 次后，订单状态仍然未更新，管理员需要手动干
 - Webhook 失败 3 次后，WooCommerce 自动调用 API 查询支付状态，减少人工干预。
 - 如果 API 查询结果显示支付/退款成功，自动更新 WooCommerce 订单状态。
 
-#### 代码实现
+#### **✅ 代码实现**
 ```php
 function trigger_api_payment_status_check($endpoint) {
     global $wpdb;
@@ -545,7 +545,7 @@ function trigger_api_payment_status_check($endpoint) {
 }
 ```
 
-## 优点
+#### 优点
 - ✅ Webhook 失败 3 次后，自动调用 API 查询支付状态
 - ✅ 防止订单卡在“待支付”状态，确保支付 & 退款状态更新
 
@@ -557,7 +557,7 @@ function trigger_api_payment_status_check($endpoint) {
 - 在 WooCommerce 后台“Webhook 失败管理”界面，提供“手动重试”按钮。
 - 管理员可以点击“立即重试”按钮，重新发送 Webhook。
 
-#### 代码实现
+#### **✅ 代码实现**
 ```php
 add_action('admin_menu', 'add_webhook_retry_menu');
 function add_webhook_retry_menu() {
@@ -591,7 +591,7 @@ function render_failed_webhooks_page() {
 }
 ```
 
-## 优点
+#### 优点
 - ✅ 管理员可手动重试 Webhook，确保支付 & 退款状态更新
 
 ### 📌 5.6 Webhook 安全验证（防止伪造 & 重放攻击）
@@ -602,7 +602,7 @@ function render_failed_webhooks_page() {
 - 使用 HMAC - SHA256 进行数据签名验证，确保 Webhook 来源真实。
 - 增加时间戳校验，防止 Webhook 被恶意重放。
 
-#### 代码实现
+#### **✅ 代码实现**
 ```php
 function verify_payment_signature($params, $received_signature) {
     $secret_key = get_option('payment_secret_key'); // 从数据库获取密钥
@@ -622,7 +622,7 @@ if (!verify_payment_signature($_POST, $received_signature)) {
 }
 ```
 
-## 优点
+#### 优点
 - ✅ 确保 Webhook 请求来源真实，防止支付 & 退款数据被伪造
 - ✅ 防止中间人攻击（MITM），确保数据完整性
 
