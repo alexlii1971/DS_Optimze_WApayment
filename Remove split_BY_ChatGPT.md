@@ -460,13 +460,70 @@ function log_webhook_failure($endpoint) {
 
 ---
 
-### **📌 5.3 Webhook 失败 3 次后，自动调用 API 查询支付状态**  
-> **问题**：Webhook 失败 3 次后，订单状态仍然未更新，管理员需要手动干预。  
-> **优化方案**：
-> - **Webhook 失败 3 次后，WooCommerce 自动调用 API 查询支付状态**，减少人工干预。  
-> - **如果 API 查询结果显示支付/退款成功，自动更新 WooCommerce 订单状态**。  
+### 📌 5.3 Webhook 失败自动重试机制
+## 问题
+Webhook 失败后，如果不进行重试，可能导致支付/退款状态更新不同步。
 
-#### **✅ 代码实现**
+## 优化方案
+- Webhook 失败后，自动加入队列，最多重试 3 次。
+- 如果重试 3 次仍失败，管理员可以手动重试。
+
+## 代码实现
+```php
+function store_failed_webhook($endpoint, $request_data) {
+    global $wpdb;
+
+    $wpdb->insert(
+        "{$wpdb->prefix}failed_webhooks",
+        [
+            'endpoint' => $endpoint,
+            'request_data' => maybe_serialize($request_data),
+            'retry_count' => 0,
+            'created_at' => current_time('mysql'),
+        ],
+        ['%s', '%s', '%d', '%s']
+    );
+}
+
+// 定期重试失败的 Webhook
+function retry_failed_webhooks() {
+    global $wpdb;
+
+    $failed_webhooks = $wpdb->get_results("SELECT * FROM {$wpdb->prefix}failed_webhooks WHERE retry_count < 3");
+
+    foreach ($failed_webhooks as $webhook) {
+        $request_data = maybe_unserialize($webhook->request_data);
+        $response = wp_remote_post($webhook->endpoint, ['body' => $request_data]);
+
+        if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) == 200) {
+            $wpdb->delete("{$wpdb->prefix}failed_webhooks", ['id' => $webhook->id]);
+        } else {
+            $wpdb->update(
+                "{$wpdb->prefix}failed_webhooks",
+                ['retry_count' => $webhook->retry_count + 1],
+                ['id' => $webhook->id]
+            );
+        }
+    }
+}
+add_action('woocommerce_cleanup_sessions', 'retry_failed_webhooks');
+```
+
+## 优点
+- ✅ Webhook 失败最多重试 3 次，防止无限重试
+- ✅ 失败超过 24 小时的 Webhook 记录会自动清理，防止数据库积累过多失败数据
+
+---
+
+### 📌 5.4 Webhook 失败 3 次后，自动调用 API 查询支付状态
+## 问题
+Webhook 失败 3 次后，订单状态仍然未更新，管理员需要手动干预。
+
+## 优化方案
+- Webhook 失败 3 次后，WooCommerce 自动调用 API 查询支付状态，减少人工干预。
+- 如果 API 查询结果显示支付/退款成功，自动更新 WooCommerce 订单状态。
+
+## 代码实现
 ```php
 function trigger_api_payment_status_check($endpoint) {
     global $wpdb;
@@ -487,18 +544,20 @@ function trigger_api_payment_status_check($endpoint) {
     }
 }
 ```
-✅ **Webhook 失败 3 次后，自动调用 API 查询支付状态**  
-✅ **防止订单卡在“待支付”状态，确保支付 & 退款状态更新**  
 
----
+## 优点
+- ✅ Webhook 失败 3 次后，自动调用 API 查询支付状态
+- ✅ 防止订单卡在“待支付”状态，确保支付 & 退款状态更新
 
-### **📌 5.4 Webhook 失败后的“手动重试”按钮**
-> **问题**：如果 Webhook 失败超过 3 次，管理员需要手动触发 Webhook。  
-> **优化方案**：
-> - **在 WooCommerce 后台“Webhook 失败管理”界面，提供“手动重试”按钮**。  
-> - **管理员可以点击“立即重试”按钮，重新发送 Webhook**。  
+### 📌 5.5 Webhook 失败后的“手动重试”按钮
+## 问题
+如果 Webhook 失败超过 3 次，管理员需要手动触发 Webhook。
 
-#### **✅ 代码实现**
+## 优化方案
+- 在 WooCommerce 后台“Webhook 失败管理”界面，提供“手动重试”按钮。
+- 管理员可以点击“立即重试”按钮，重新发送 Webhook。
+
+## 代码实现
 ```php
 add_action('admin_menu', 'add_webhook_retry_menu');
 function add_webhook_retry_menu() {
@@ -531,7 +590,66 @@ function render_failed_webhooks_page() {
     echo '</table>';
 }
 ```
-✅ **管理员可手动重试 Webhook，确保支付 & 退款状态更新**  
+
+## 优点
+- ✅ 管理员可手动重试 Webhook，确保支付 & 退款状态更新
+
+### 📌 5.6 Webhook 安全验证（防止伪造 & 重放攻击）
+## 问题
+攻击者可能伪造 Webhook 请求，篡改支付/退款状态。
+
+## 优化方案
+- 使用 HMAC - SHA256 进行数据签名验证，确保 Webhook 来源真实。
+- 增加时间戳校验，防止 Webhook 被恶意重放。
+
+## 代码实现
+```php
+function verify_payment_signature($params, $received_signature) {
+    $secret_key = get_option('payment_secret_key'); // 从数据库获取密钥
+
+    ksort($params);
+    $query_string = http_build_query($params);
+    $expected_signature = hash_hmac('sha256', $query_string, $secret_key);
+
+    return hash_equals($expected_signature, $received_signature);
+}
+
+// 在 Webhook 处理时调用
+$received_signature = $_POST['sign'] ?? '';
+
+if (!verify_payment_signature($_POST, $received_signature)) {
+    wp_die("签名验证失败，数据可能被篡改", "403 Forbidden", ['response' => 403]);
+}
+```
+
+## 优点
+- ✅ 确保 Webhook 请求来源真实，防止支付 & 退款数据被伪造
+- ✅ 防止中间人攻击（MITM），确保数据完整性
+
+### 5.7 Webhook 详细日志增强 & 结构化格式优化
+## 目标
+记录所有 Webhook 请求 & 响应，方便调试 & 监控，确保支付 & 退款过程可追溯。
+
+## 📌 5.7.1 结构化记录 Webhook 请求
+```php
+function log_webhook_request($endpoint, $request_data) {
+    $logger = wc_get_logger();
+    
+    $message = "[Webhook 回调] [" . strtoupper($endpoint) . "]\n";
+    $message .= "========================================\n";
+    $message .= "订单 ID: " . ($request_data['order_id'] ?? '未知') . "\n";
+    $message .= "交易号: " . ($request_data['transaction_id'] ?? '未知') . "\n";
+    $message .= "状态: " . ($request_data['status'] ?? '未知') . "\n";
+    $message .= "请求时间: " . current_time('mysql') . "\n";
+    $message .= "========================================\n";
+    
+    $logger->info($message, ['source' => 'wechat_alipay_webhook']);
+}
+```
+
+## 优点
+- ✅ 记录 Webhook 详细日志，便于调试
+- ✅ 确保 Webhook 数据可追溯
 
 ---
  ## **6. 优化 WooCommerce 订单管理后台的支付 & 退款交互**  
