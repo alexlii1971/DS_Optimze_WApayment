@@ -47,8 +47,9 @@
 ✅ **短信 & 邮件通知支付/退款状态**，提升用户体验，并支持**网络级配置继承**。  
 ✅ **管理员可在 WooCommerce 后台查看支付统计数据**，便于运营管理。  
 ✅ **模块化设计，避免功能间耦合，支持插件扩展性**，确保灵活配置和可维护性。  
-
 ✅ **适用于** **WordPress Multisite + WooCommerce**，支持不同子站**独立管理**或**网络级集中管理**支付功能。  
+✅ **支持最新wordpress版本，向下兼容**：https://github.com/WordPress/WordPress/tags
+✅ **支持最新WooCommerce版本，向下兼容** https://github.com/woocommerce/woocommerce/releases
 
 ---
 
